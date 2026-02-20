@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"database/sql"
 	"encoding/json"
 	"fmt"
@@ -11,9 +12,11 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/signal"
 	"regexp"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	_ "github.com/mattn/go-sqlite3"
@@ -566,12 +569,10 @@ func main() {
 	}
 
 	initMainDB()
-	defer mainDB.Close()
 
 	// Resume any domains already in the DB from a previous run
 	rows, err := mainDB.Query(`SELECT domain, interval FROM domains`)
 	if err == nil {
-		defer rows.Close()
 		for rows.Next() {
 			var d string
 			var iv int
@@ -584,6 +585,7 @@ func main() {
 				crawlersMu.Unlock()
 			}
 		}
+		rows.Close()
 	}
 
 	mux := http.NewServeMux()
@@ -591,7 +593,59 @@ func main() {
 	mux.HandleFunc("/api/add_domain", addDomainHandler)
 	mux.HandleFunc("/api/sse/", sseHandler)
 
-	port := ":8080"
-	log.Printf("siliconpin_spider listening on %s", port)
-	log.Fatal(http.ListenAndServe(port, mux))
+	srv := &http.Server{
+		Addr:    ":8080",
+		Handler: mux,
+	}
+
+	// ── Graceful shutdown ────────────────────────────────────────
+	quit := make(chan os.Signal, 1)
+	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+
+	go func() {
+		log.Printf("siliconpin_spider listening on %s", srv.Addr)
+		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Fatalf("server error: %v", err)
+		}
+	}()
+
+	sig := <-quit
+	log.Printf("received %s — shutting down gracefully…", sig)
+
+	// 1. Stop accepting new HTTP requests; give in-flight ones 10s to finish
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := srv.Shutdown(ctx); err != nil {
+		log.Printf("HTTP shutdown error: %v", err)
+	}
+
+	// 2. Notify all SSE clients
+	brokersMu.RLock()
+	for domain, br := range brokers {
+		emit(br, "shutdown", map[string]string{"domain": domain, "msg": "server stopping"})
+	}
+	brokersMu.RUnlock()
+
+	// Brief pause so SSE messages flush to clients
+	time.Sleep(500 * time.Millisecond)
+
+	// 3. Checkpoint WAL → merge pending writes into the .sqlite file
+	//    After this the .sqlite is fully self-contained (no WAL needed).
+	domainDBsMu.RLock()
+	for domain, db := range domainDBs {
+		if _, err := db.Exec(`PRAGMA wal_checkpoint(TRUNCATE)`); err != nil {
+			log.Printf("checkpoint %s: %v", domain, err)
+		} else {
+			log.Printf("checkpointed %s.sqlite", domain)
+		}
+		db.Close()
+	}
+	domainDBsMu.RUnlock()
+
+	if _, err := mainDB.Exec(`PRAGMA wal_checkpoint(TRUNCATE)`); err != nil {
+		log.Printf("checkpoint main DB: %v", err)
+	}
+	mainDB.Close()
+
+	log.Println("shutdown complete — all WAL data flushed, goodbye.")
 }
