@@ -5,134 +5,379 @@
 <meta name="viewport" content="width=device-width,initial-scale=1"/>
 <title>SiliconPin Spider</title>
 <style>
-  *{box-sizing:border-box;margin:0;padding:0}
-  body{font-family:'Segoe UI',sans-serif;background:#0f1117;color:#e0e0e0;min-height:100vh;padding:32px 20px}
-  h1{color:#58a6ff;font-size:1.8rem;margin-bottom:4px}
-  .sub{color:#8b949e;font-size:.9rem;margin-bottom:32px}
-  .card{background:#161b22;border:1px solid #30363d;border-radius:10px;padding:24px;max-width:680px;margin-bottom:24px}
-  h2{font-size:1rem;color:#cdd9e5;margin-bottom:16px}
-  label{display:block;font-size:.82rem;color:#8b949e;margin-bottom:4px}
-  input{width:100%;padding:8px 12px;background:#0d1117;border:1px solid #30363d;border-radius:6px;color:#e0e0e0;font-size:.92rem;outline:none;transition:border .2s}
-  input:focus{border-color:#58a6ff}
-  .row{display:flex;gap:12px;margin-bottom:14px}
-  .row>div{flex:1}
-  button{padding:9px 22px;background:#238636;border:none;border-radius:6px;color:#fff;font-size:.9rem;cursor:pointer;transition:background .2s}
-  button:hover{background:#2ea043}
-  #log{background:#0d1117;border:1px solid #30363d;border-radius:8px;padding:16px;height:340px;overflow-y:auto;font-size:.8rem;font-family:monospace;margin-top:12px}
-  .ev{padding:3px 0;border-bottom:1px solid #1c2128;display:flex;gap:8px;align-items:flex-start}
-  .ev:last-child{border-bottom:none}
-  .badge{font-size:.7rem;padding:2px 7px;border-radius:12px;white-space:nowrap;font-weight:600}
-  .connected{background:#1f4e79;color:#79c0ff}
-  .status   {background:#2d333b;color:#cdd9e5}
-  .robots   {background:#3b2300;color:#f0883e}
-  .waiting  {background:#1c2a1e;color:#56d364}
-  .fetching {background:#172033;color:#79c0ff}
-  .saved    {background:#0d2818;color:#56d364}
-  .links_found{background:#1f2d3d;color:#a5d6ff}
-  .skipped  {background:#2d2d00;color:#e3b341}
-  .error    {background:#3d0000;color:#f85149}
-  .done     {background:#1f4e2c;color:#56d364}
-  .keepalive{background:#2d333b;color:#484f58;font-style:italic}
-  .ev-body{word-break:break-all;color:#cdd9e5}
-  .status-dot{width:8px;height:8px;border-radius:50%;background:#484f58;display:inline-block;margin-right:6px;flex-shrink:0;margin-top:4px}
-  .status-dot.live{background:#56d364;animation:pulse 1.5s infinite}
-  @keyframes pulse{0%,100%{opacity:1}50%{opacity:.4}}
-  .conn-row{display:flex;align-items:center;gap:8px;margin-bottom:8px}
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:'Segoe UI',system-ui,sans-serif;background:#0d1117;color:#c9d1d9;min-height:100vh}
+a{color:#58a6ff;text-decoration:none}
+
+/* ── layout ─────────────────────────── */
+.layout{display:grid;grid-template-columns:320px 1fr;height:100vh;overflow:hidden}
+.sidebar{background:#161b22;border-right:1px solid #30363d;display:flex;flex-direction:column;overflow:hidden}
+.main{display:flex;flex-direction:column;overflow:hidden}
+
+/* ── sidebar header ─────────────────── */
+.sidebar-header{padding:16px;border-bottom:1px solid #30363d;flex-shrink:0}
+.sidebar-header h1{font-size:1.1rem;color:#58a6ff;display:flex;align-items:center;gap:6px}
+.sidebar-header p{font-size:.75rem;color:#8b949e;margin-top:3px}
+
+/* ── add domain form ────────────────── */
+.add-form{padding:12px 16px;border-bottom:1px solid #30363d;flex-shrink:0}
+.add-form .row{display:flex;gap:6px;margin-bottom:8px}
+.add-form input{flex:1;padding:6px 10px;background:#0d1117;border:1px solid #30363d;border-radius:6px;color:#c9d1d9;font-size:.82rem;outline:none}
+.add-form input:focus{border-color:#58a6ff}
+.add-form input.narrow{max-width:80px;flex:none}
+.btn{padding:6px 14px;border:none;border-radius:6px;cursor:pointer;font-size:.82rem;font-weight:600;transition:opacity .15s}
+.btn:hover{opacity:.85}
+.btn-green{background:#238636;color:#fff}
+.btn-gray{background:#30363d;color:#c9d1d9}
+.btn-yellow{background:#9e6a03;color:#fff}
+.btn-blue{background:#1f6feb;color:#fff}
+.add-result{font-size:.75rem;color:#8b949e;min-height:16px}
+
+/* ── domain list ────────────────────── */
+.domain-list{flex:1;overflow-y:auto;padding:8px 0}
+.domain-card{padding:10px 16px;cursor:pointer;border-left:3px solid transparent;transition:background .12s}
+.domain-card:hover{background:#1c2128}
+.domain-card.active{background:#1c2128;border-left-color:#58a6ff}
+.domain-card .dc-name{font-size:.88rem;font-weight:600;color:#e6edf3;display:flex;align-items:center;gap:6px}
+.domain-card .dc-meta{font-size:.72rem;color:#8b949e;margin-top:3px;display:flex;gap:10px}
+.domain-card .dc-parent{font-size:.7rem;color:#6e7681;margin-top:2px}
+
+/* ── status badge ───────────────────── */
+.badge{font-size:.65rem;padding:1px 7px;border-radius:10px;font-weight:700;white-space:nowrap}
+.b-running {background:#0d4429;color:#3fb950}
+.b-paused  {background:#3d2e00;color:#d29922}
+.b-done    {background:#0d2040;color:#58a6ff}
+.b-pending {background:#282d33;color:#8b949e}
+
+/* ── main area ──────────────────────── */
+.main-header{padding:12px 20px;border-bottom:1px solid #30363d;display:flex;align-items:center;gap:12px;flex-shrink:0;background:#161b22}
+.main-header h2{font-size:1rem;color:#e6edf3;flex:1}
+.conn-dot{width:9px;height:9px;border-radius:50%;background:#3fb950;flex-shrink:0}
+.conn-dot.off{background:#484f58}
+.conn-dot.pulse{animation:pulse 1.5s infinite}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.3}}
+
+.log-wrap{flex:1;overflow-y:auto;padding:10px 16px;font-family:'Cascadia Code','Fira Code',monospace;font-size:.75rem}
+.ev{display:flex;gap:8px;padding:3px 0;border-bottom:1px solid #161b22;align-items:flex-start}
+.ev-badge{font-size:.67rem;padding:1px 7px;border-radius:10px;font-weight:700;white-space:nowrap;flex-shrink:0;margin-top:1px}
+.ev-body{word-break:break-all;color:#8b949e}
+.ev-body b{color:#c9d1d9}
+
+/* event colours */
+.e-connected   {background:#0d2040;color:#58a6ff}
+.e-status      {background:#1c2128;color:#8b949e}
+.e-robots      {background:#3d2200;color:#d29922}
+.e-waiting     {background:#0d2e1a;color:#3fb950}
+.e-fetching    {background:#0d2040;color:#79c0ff}
+.e-saved       {background:#0d2e1a;color:#3fb950}
+.e-links_found {background:#112040;color:#a5d6ff}
+.e-skipped     {background:#2d2600;color:#d29922}
+.e-error       {background:#3d0000;color:#f85149}
+.e-done        {background:#0d2040;color:#79c0ff}
+.e-paused      {background:#3d2e00;color:#d29922}
+.e-resumed     {background:#0d2e1a;color:#3fb950}
+.e-new_domain  {background:#1f1640;color:#d2a8ff}
+.e-shutdown    {background:#2d0000;color:#f85149}
+
+.empty{color:#484f58;padding:20px;text-align:center;font-size:.82rem}
+.stats-bar{display:flex;gap:16px;padding:6px 20px;background:#0d1117;border-bottom:1px solid #21262d;font-size:.73rem;color:#8b949e;flex-shrink:0}
+.stats-bar span b{color:#c9d1d9}
+
+/* ── no-domain placeholder ──────────── */
+.placeholder{flex:1;display:flex;align-items:center;justify-content:center;flex-direction:column;gap:10px;color:#484f58}
+.placeholder svg{opacity:.3}
 </style>
 </head>
 <body>
-<h1>🕷 SiliconPin Spider</h1>
-<p class="sub">Polite web crawler — respects robots.txt · random delay · SSE live feed</p>
+<div class="layout">
 
-<div class="card">
-  <h2>Add domain</h2>
-  <div class="row">
-    <div>
-      <label>Domain</label>
-      <input id="domain" placeholder="siliconpin.com" value=""/>
-    </div>
-    <div>
-      <label>Crawl-delay (s)</label>
-      <input id="delay" placeholder="20" value="20" style="max-width:100px"/>
-    </div>
+<!-- ═══════════════ SIDEBAR ═══════════════ -->
+<aside class="sidebar">
+  <div class="sidebar-header">
+    <h1>🕷 SiliconPin Spider</h1>
+    <p>Polite web crawler · robots.txt · SSE live</p>
   </div>
-  <button onclick="addDomain()">Add &amp; Crawl</button>
-  <div id="addResult" style="margin-top:10px;font-size:.82rem;color:#8b949e"></div>
-</div>
 
-<div class="card">
-  <h2>Live SSE stream</h2>
-  <div class="conn-row">
-    <span class="status-dot" id="dot"></span>
-    <input id="sseDomain" placeholder="siliconpin.com" style="flex:1"/>
-    <button onclick="connectSSE()">Connect</button>
-    <button onclick="clearLog()" style="background:#30363d">Clear</button>
+  <div class="add-form">
+    <div class="row">
+      <input id="inp-domain" placeholder="domain.com" autocomplete="off"/>
+      <input id="inp-delay"  placeholder="delay s" class="narrow" value="20"/>
+    </div>
+    <div class="row">
+      <button class="btn btn-green" onclick="addDomain()">+ Add &amp; Crawl</button>
+      <button class="btn btn-gray"  onclick="refreshList()">↻ Refresh</button>
+    </div>
+    <div class="add-result" id="add-result"></div>
   </div>
-  <div id="log"><span style="color:#484f58">— events will appear here —</span></div>
+
+  <div class="domain-list" id="domain-list">
+    <div class="empty">No domains yet</div>
+  </div>
+</aside>
+
+<!-- ═══════════════ MAIN ═══════════════ -->
+<main class="main">
+  <div id="main-placeholder" class="placeholder" style="flex:1;display:flex">
+    <svg width="64" height="64" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1">
+      <circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/>
+      <line x1="12" y1="16" x2="12.01" y2="16"/>
+    </svg>
+    <p>Select a domain to watch its live feed</p>
+  </div>
+
+  <div id="main-panel" style="display:none;flex-direction:column;flex:1;overflow:hidden">
+    <div class="main-header">
+      <span class="conn-dot off" id="conn-dot"></span>
+      <h2 id="panel-title">—</h2>
+      <button class="btn btn-yellow" id="btn-pause"  onclick="pauseDomain()">⏸ Pause</button>
+      <button class="btn btn-blue"   id="btn-resume" onclick="resumeDomain()" style="display:none">▶ Resume</button>
+      <button class="btn btn-gray"   onclick="clearLog()">✕ Clear</button>
+    </div>
+    <div class="stats-bar" id="stats-bar">
+      <span>URLs: <b id="stat-urls">—</b></span>
+      <span>Queue: <b id="stat-queue">—</b></span>
+      <span>Status: <b id="stat-status">—</b></span>
+      <span>Interval: <b id="stat-interval">—</b>s</span>
+    </div>
+    <div class="log-wrap" id="log"></div>
+  </div>
+</main>
+
 </div>
 
 <script>
-let es = null;
+// ── state ──────────────────────────────────────────────────
+let activeDomain = null;
+let activeSSE    = null;
+let globalSSE    = null;
+let domainMap    = {}; // domain → row data
 
+// ── init ───────────────────────────────────────────────────
+window.addEventListener('DOMContentLoaded', () => {
+  refreshList();
+  connectGlobalSSE();
+  setInterval(refreshList, 15000);
+});
+
+// ── global SSE (new_domain, shutdown) ──────────────────────
+function connectGlobalSSE() {
+  if (globalSSE) globalSSE.close();
+  globalSSE = new EventSource('/api/sse/');
+  globalSSE.onmessage = e => {
+    try {
+      const obj = JSON.parse(e.data);
+      if (obj.event === 'new_domain') {
+        refreshList();
+        // auto-open if it was discovered from the active domain
+        if (activeDomain && obj.data.parent === activeDomain) {
+          appendLog({event:'new_domain', data:obj.data});
+        }
+      }
+    } catch(_) {}
+  };
+}
+
+// ── fetch domain list ───────────────────────────────────────
+async function refreshList() {
+  const res = await fetch('/api/domains');
+  if (!res.ok) return;
+  const list = await res.json();
+  domainMap = {};
+  list.forEach(d => domainMap[d.domain] = d);
+  renderList(list);
+  if (activeDomain && domainMap[activeDomain]) updateStats(domainMap[activeDomain]);
+}
+
+function renderList(list) {
+  const el = document.getElementById('domain-list');
+  if (!list || list.length === 0) {
+    el.innerHTML = '<div class="empty">No domains yet</div>';
+    return;
+  }
+  el.innerHTML = list.map(d => `
+    <div class="domain-card${d.domain === activeDomain ? ' active' : ''}"
+         id="dc-${esc(d.domain)}" onclick="selectDomain('${esc(d.domain)}')">
+      <div class="dc-name">
+        <span>${esc(d.domain)}</span>
+        <span class="badge b-${d.status}">${d.status}</span>
+      </div>
+      <div class="dc-meta">
+        <span>✓ ${d.url_count} urls</span>
+        <span>⏳ ${d.queue_len} queued</span>
+        <span>⏱ ${d.interval}s</span>
+      </div>
+      ${d.parent ? `<div class="dc-parent">↳ from ${esc(d.parent)}</div>` : ''}
+    </div>`).join('');
+}
+
+// ── select domain → connect SSE ────────────────────────────
+function selectDomain(domain) {
+  if (activeDomain === domain) return;
+  activeDomain = domain;
+
+  // highlight sidebar
+  document.querySelectorAll('.domain-card').forEach(c => c.classList.remove('active'));
+  const card = document.getElementById('dc-' + domain);
+  if (card) card.classList.add('active');
+
+  // show panel
+  document.getElementById('main-placeholder').style.display = 'none';
+  const panel = document.getElementById('main-panel');
+  panel.style.display = 'flex';
+  document.getElementById('panel-title').textContent = domain;
+  clearLog();
+
+  // update stats
+  if (domainMap[domain]) updateStats(domainMap[domain]);
+
+  // SSE
+  if (activeSSE) activeSSE.close();
+  setDot(true);
+  activeSSE = new EventSource('/api/sse/' + domain);
+  activeSSE.onmessage = e => {
+    try { appendLog(JSON.parse(e.data)); } catch(_) {}
+  };
+  activeSSE.onerror = () => setDot(false);
+}
+
+function updateStats(d) {
+  document.getElementById('stat-urls').textContent     = d.url_count;
+  document.getElementById('stat-queue').textContent    = d.queue_len;
+  document.getElementById('stat-status').textContent   = d.status;
+  document.getElementById('stat-interval').textContent = d.interval;
+
+  const paused = d.status === 'paused';
+  document.getElementById('btn-pause').style.display  = paused ? 'none' : '';
+  document.getElementById('btn-resume').style.display = paused ? ''     : 'none';
+}
+
+// ── log rendering ───────────────────────────────────────────
+function appendLog(obj) {
+  const event = obj.event || 'status';
+  const data  = obj.data  || {};
+
+  // update stats inline from events
+  if (event === 'saved' || event === 'links_found' || event === 'waiting') {
+    if (domainMap[activeDomain] && event === 'saved') {
+      domainMap[activeDomain].url_count++;
+      document.getElementById('stat-urls').textContent = domainMap[activeDomain].url_count;
+    }
+    if (data.queue_len !== undefined && domainMap[activeDomain]) {
+      domainMap[activeDomain].queue_len = data.queue_len ?? data.queue ?? 0;
+      document.getElementById('stat-queue').textContent = domainMap[activeDomain].queue_len;
+    }
+  }
+  if (event === 'paused' || event === 'resumed' || event === 'done') {
+    refreshList();
+    const st = event === 'paused' ? 'paused' : event === 'done' ? 'done' : 'running';
+    document.getElementById('stat-status').textContent = st;
+    document.getElementById('btn-pause').style.display  = (event === 'paused') ? 'none' : '';
+    document.getElementById('btn-resume').style.display = (event === 'paused') ? ''     : 'none';
+  }
+  if (event === 'new_domain') refreshList();
+
+  const body = formatBody(event, data);
+  const log  = document.getElementById('log');
+  if (log.querySelector('.empty')) log.innerHTML = '';
+
+  const div = document.createElement('div');
+  div.className = 'ev';
+  div.innerHTML = `<span class="ev-badge e-${event}">${event}</span><span class="ev-body">${body}</span>`;
+  log.appendChild(div);
+  log.scrollTop = log.scrollHeight;
+}
+
+function formatBody(event, data) {
+  if (typeof data === 'string') return esc(data);
+  switch (event) {
+    case 'waiting':
+      return `<b>${esc(data.url||'')}</b> — delay <b>${data.delay_s}s</b>, queue <b>${data.queue}</b>`;
+    case 'fetching':
+      return `<b>${esc(data.url||'')}</b>`;
+    case 'saved':
+      return `<b>${esc(data.url||'')}</b> <span style="color:#6e7681">[${data.status} ${esc(data.content_type||'')}]</span>`;
+    case 'links_found':
+      return `<b>${esc(data.url||'')}</b> — found <b>${data.found}</b> same-host, <b>${data.new}</b> new, <b>${data.external||0}</b> external, queue <b>${data.queue_len}</b>`;
+    case 'skipped':
+      return `<b>${esc(data.url||'')}</b> — ${esc(data.reason||'')}`;
+    case 'error':
+      return `<b>${esc(data.url||data.msg||'')}</b>${data.url ? ' — '+esc(data.msg||'') : ''}`;
+    case 'robots':
+      return `delay <b>${data.robots_delay}s</b> → effective <b>${data.effective_delay}s</b>, disallowed: <b>${(data.disallowed||[]).length}</b>`;
+    case 'new_domain':
+      return `discovered <b>${esc(data.domain||'')}</b>${data.parent ? ` from <b>${esc(data.parent)}</b>` : ''}`;
+    case 'done':
+      return `<b>${esc(data.domain||'')}</b> — crawl complete ✓`;
+    case 'paused':
+      return `crawler paused — send <b>resume</b> to continue`;
+    case 'resumed':
+      return `crawler resumed`;
+    case 'connected':
+      return `stream connected for <b>${esc(data.domain||'')}</b>`;
+    default:
+      return esc(typeof data === 'object' ? JSON.stringify(data) : String(data));
+  }
+}
+
+// ── add domain ──────────────────────────────────────────────
 async function addDomain() {
-  const domain = document.getElementById('domain').value.trim();
-  const delay  = document.getElementById('delay').value.trim();
-  if (!domain) { alert('Domain is required'); return; }
+  const domain = document.getElementById('inp-domain').value.trim();
+  const delay  = document.getElementById('inp-delay').value.trim();
+  if (!domain) { showResult('Domain is required', true); return; }
+
   const res = await fetch('/api/add_domain', {
     method: 'POST',
     headers: {'Content-Type':'application/json'},
     body: JSON.stringify({domain, 'Crawl-delay': delay})
   });
   const data = await res.json();
-  const el = document.getElementById('addResult');
   if (res.ok) {
-    el.style.color = '#56d364';
-    el.textContent = `✓ ${data.message} — SSE: ${data.sse}`;
-    document.getElementById('sseDomain').value = domain;
+    showResult(`✓ ${data.message}`, false);
+    document.getElementById('inp-domain').value = '';
+    await refreshList();
+    selectDomain(data.domain);
   } else {
-    el.style.color = '#f85149';
-    el.textContent = `✗ ${data.error}`;
+    showResult(`✗ ${data.error}`, true);
   }
 }
 
-function connectSSE() {
-  const domain = document.getElementById('sseDomain').value.trim();
-  if (!domain) { alert('Enter a domain'); return; }
-  if (es) { es.close(); }
-  document.getElementById('dot').className = 'status-dot live';
-  es = new EventSource('/api/sse/' + domain);
-  es.onmessage = function(e) { appendEvent(e.data); };
-  es.onerror   = function()  {
-    appendRaw('keepalive','connection error / closed');
-    document.getElementById('dot').className = 'status-dot';
-  };
+function showResult(msg, err) {
+  const el = document.getElementById('add-result');
+  el.textContent = msg;
+  el.style.color = err ? '#f85149' : '#3fb950';
 }
 
-function appendEvent(raw) {
-  let obj;
-  try { obj = JSON.parse(raw); } catch(e) { appendRaw('status', raw); return; }
-  const event = obj.event || 'status';
-  const data  = typeof obj.data === 'object' ? JSON.stringify(obj.data) : String(obj.data);
-  appendRaw(event, data);
+// ── pause / resume ──────────────────────────────────────────
+async function pauseDomain() {
+  if (!activeDomain) return;
+  await fetch('/api/pause/' + activeDomain, {method:'POST'});
 }
 
-function appendRaw(event, text) {
-  const log = document.getElementById('log');
-  if (log.querySelector('span')) log.innerHTML = '';
-  const div = document.createElement('div');
-  div.className = 'ev';
-  div.innerHTML = `<span class="badge ${event}">${event}</span><span class="ev-body">${escHtml(text)}</span>`;
-  log.appendChild(div);
-  log.scrollTop = log.scrollHeight;
+async function resumeDomain() {
+  if (!activeDomain) return;
+  await fetch('/api/resume/' + activeDomain, {method:'POST'});
 }
 
+// ── utils ───────────────────────────────────────────────────
 function clearLog() {
-  document.getElementById('log').innerHTML = '<span style="color:#484f58">— cleared —</span>';
+  document.getElementById('log').innerHTML = '<div class="empty">— waiting for events —</div>';
 }
 
-function escHtml(s) {
-  return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+function setDot(live) {
+  const dot = document.getElementById('conn-dot');
+  dot.className = 'conn-dot' + (live ? ' pulse' : ' off');
 }
+
+function esc(s) {
+  return String(s)
+    .replace(/&/g,'&amp;').replace(/</g,'&lt;')
+    .replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+
+// keyboard shortcut: Enter in domain input
+document.addEventListener('keydown', e => {
+  if (e.key === 'Enter' && document.activeElement.id === 'inp-domain') addDomain();
+});
 </script>
 </body>
 </html>
