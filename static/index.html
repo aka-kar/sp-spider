@@ -1,0 +1,138 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>SiliconPin Spider</title>
+<style>
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{font-family:'Segoe UI',sans-serif;background:#0f1117;color:#e0e0e0;min-height:100vh;padding:32px 20px}
+  h1{color:#58a6ff;font-size:1.8rem;margin-bottom:4px}
+  .sub{color:#8b949e;font-size:.9rem;margin-bottom:32px}
+  .card{background:#161b22;border:1px solid #30363d;border-radius:10px;padding:24px;max-width:680px;margin-bottom:24px}
+  h2{font-size:1rem;color:#cdd9e5;margin-bottom:16px}
+  label{display:block;font-size:.82rem;color:#8b949e;margin-bottom:4px}
+  input{width:100%;padding:8px 12px;background:#0d1117;border:1px solid #30363d;border-radius:6px;color:#e0e0e0;font-size:.92rem;outline:none;transition:border .2s}
+  input:focus{border-color:#58a6ff}
+  .row{display:flex;gap:12px;margin-bottom:14px}
+  .row>div{flex:1}
+  button{padding:9px 22px;background:#238636;border:none;border-radius:6px;color:#fff;font-size:.9rem;cursor:pointer;transition:background .2s}
+  button:hover{background:#2ea043}
+  #log{background:#0d1117;border:1px solid #30363d;border-radius:8px;padding:16px;height:340px;overflow-y:auto;font-size:.8rem;font-family:monospace;margin-top:12px}
+  .ev{padding:3px 0;border-bottom:1px solid #1c2128;display:flex;gap:8px;align-items:flex-start}
+  .ev:last-child{border-bottom:none}
+  .badge{font-size:.7rem;padding:2px 7px;border-radius:12px;white-space:nowrap;font-weight:600}
+  .connected{background:#1f4e79;color:#79c0ff}
+  .status   {background:#2d333b;color:#cdd9e5}
+  .robots   {background:#3b2300;color:#f0883e}
+  .waiting  {background:#1c2a1e;color:#56d364}
+  .fetching {background:#172033;color:#79c0ff}
+  .saved    {background:#0d2818;color:#56d364}
+  .links_found{background:#1f2d3d;color:#a5d6ff}
+  .skipped  {background:#2d2d00;color:#e3b341}
+  .error    {background:#3d0000;color:#f85149}
+  .done     {background:#1f4e2c;color:#56d364}
+  .keepalive{background:#2d333b;color:#484f58;font-style:italic}
+  .ev-body{word-break:break-all;color:#cdd9e5}
+  .status-dot{width:8px;height:8px;border-radius:50%;background:#484f58;display:inline-block;margin-right:6px;flex-shrink:0;margin-top:4px}
+  .status-dot.live{background:#56d364;animation:pulse 1.5s infinite}
+  @keyframes pulse{0%,100%{opacity:1}50%{opacity:.4}}
+  .conn-row{display:flex;align-items:center;gap:8px;margin-bottom:8px}
+</style>
+</head>
+<body>
+<h1>🕷 SiliconPin Spider</h1>
+<p class="sub">Polite web crawler — respects robots.txt · random delay · SSE live feed</p>
+
+<div class="card">
+  <h2>Add domain</h2>
+  <div class="row">
+    <div>
+      <label>Domain</label>
+      <input id="domain" placeholder="siliconpin.com" value=""/>
+    </div>
+    <div>
+      <label>Crawl-delay (s)</label>
+      <input id="delay" placeholder="20" value="20" style="max-width:100px"/>
+    </div>
+  </div>
+  <button onclick="addDomain()">Add &amp; Crawl</button>
+  <div id="addResult" style="margin-top:10px;font-size:.82rem;color:#8b949e"></div>
+</div>
+
+<div class="card">
+  <h2>Live SSE stream</h2>
+  <div class="conn-row">
+    <span class="status-dot" id="dot"></span>
+    <input id="sseDomain" placeholder="siliconpin.com" style="flex:1"/>
+    <button onclick="connectSSE()">Connect</button>
+    <button onclick="clearLog()" style="background:#30363d">Clear</button>
+  </div>
+  <div id="log"><span style="color:#484f58">— events will appear here —</span></div>
+</div>
+
+<script>
+let es = null;
+
+async function addDomain() {
+  const domain = document.getElementById('domain').value.trim();
+  const delay  = document.getElementById('delay').value.trim();
+  if (!domain) { alert('Domain is required'); return; }
+  const res = await fetch('/api/add_domain', {
+    method: 'POST',
+    headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({domain, 'Crawl-delay': delay})
+  });
+  const data = await res.json();
+  const el = document.getElementById('addResult');
+  if (res.ok) {
+    el.style.color = '#56d364';
+    el.textContent = `✓ ${data.message} — SSE: ${data.sse}`;
+    document.getElementById('sseDomain').value = domain;
+  } else {
+    el.style.color = '#f85149';
+    el.textContent = `✗ ${data.error}`;
+  }
+}
+
+function connectSSE() {
+  const domain = document.getElementById('sseDomain').value.trim();
+  if (!domain) { alert('Enter a domain'); return; }
+  if (es) { es.close(); }
+  document.getElementById('dot').className = 'status-dot live';
+  es = new EventSource('/api/sse/' + domain);
+  es.onmessage = function(e) { appendEvent(e.data); };
+  es.onerror   = function()  {
+    appendRaw('keepalive','connection error / closed');
+    document.getElementById('dot').className = 'status-dot';
+  };
+}
+
+function appendEvent(raw) {
+  let obj;
+  try { obj = JSON.parse(raw); } catch(e) { appendRaw('status', raw); return; }
+  const event = obj.event || 'status';
+  const data  = typeof obj.data === 'object' ? JSON.stringify(obj.data) : String(obj.data);
+  appendRaw(event, data);
+}
+
+function appendRaw(event, text) {
+  const log = document.getElementById('log');
+  if (log.querySelector('span')) log.innerHTML = '';
+  const div = document.createElement('div');
+  div.className = 'ev';
+  div.innerHTML = `<span class="badge ${event}">${event}</span><span class="ev-body">${escHtml(text)}</span>`;
+  log.appendChild(div);
+  log.scrollTop = log.scrollHeight;
+}
+
+function clearLog() {
+  document.getElementById('log').innerHTML = '<span style="color:#484f58">— cleared —</span>';
+}
+
+function escHtml(s) {
+  return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+</script>
+</body>
+</html>
