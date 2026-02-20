@@ -27,8 +27,10 @@ import (
 // ─────────────────────────────────────────────────────────────────
 
 const mainDBFile = "siliconpin_spider.sqlite"
+const skipDBFile = "skip_domain_list.sqlite"
 
 var mainDB *sql.DB
+var skipDB *sql.DB
 
 // SSE brokers  – one per domain
 var (
@@ -162,6 +164,66 @@ func initMainDB() {
 		log.Fatalf("create domains table: %v", err)
 	}
 	log.Printf("Main DB ready: %s", mainDBFile)
+}
+
+func initSkipDB() {
+	var err error
+	skipDB, err = sql.Open("sqlite3", skipDBFile+"?_journal=WAL&_busy_timeout=5000")
+	if err != nil {
+		log.Fatalf("open skip DB: %v", err)
+	}
+	_, err = skipDB.Exec(`
+		CREATE TABLE IF NOT EXISTS skip_domains (
+			id         INTEGER  PRIMARY KEY AUTOINCREMENT,
+			domain     TEXT     NOT NULL UNIQUE,
+			reason     TEXT     NOT NULL DEFAULT '',
+			created_at DATETIME NOT NULL
+		)`)
+	if err != nil {
+		log.Fatalf("create skip_domains table: %v", err)
+	}
+
+	// Seed default skip list — INSERT OR IGNORE so re-runs are safe
+	defaults := []struct{ domain, reason string }{
+		{"google.com", "analytics / search engine"},
+		{"facebook.com", "social media tracker"},
+		{"linkedin.com", "social media tracker"},
+		{"googletagmanager.com", "tag manager / analytics"},
+	}
+	now := time.Now().UTC().Format(time.RFC3339)
+	for _, e := range defaults {
+		skipDB.Exec(
+			`INSERT OR IGNORE INTO skip_domains (domain, reason, created_at) VALUES (?, ?, ?)`,
+			e.domain, e.reason, now)
+	}
+	log.Printf("Skip DB ready: %s", skipDBFile)
+}
+
+// isDomainSkipped returns true if the domain (or any parent domain suffix) is
+// in the skip list.  e.g. "cdn.google.com" matches the "google.com" entry.
+func isDomainSkipped(domain string) bool {
+	// exact match
+	var c int
+	skipDB.QueryRow(`SELECT COUNT(1) FROM skip_domains WHERE domain = ?`, domain).Scan(&c)
+	if c > 0 {
+		return true
+	}
+	// suffix match: check if domain ends with "."+skipEntry
+	rows, err := skipDB.Query(`SELECT domain FROM skip_domains`)
+	if err != nil {
+		return false
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var entry string
+		if rows.Scan(&entry) != nil {
+			continue
+		}
+		if strings.HasSuffix(domain, "."+entry) {
+			return true
+		}
+	}
+	return false
 }
 
 func setDomainStatus(domain, status string) {
@@ -334,6 +396,12 @@ func seedQueue(db *sql.DB, startURL string) {
 
 // recordExtLink saves a discovered external domain and auto-registers it.
 func recordExtLink(srcDomain, extDomain string, parentInterval int) {
+	// Skip domains on the block list (and their subdomains)
+	if isDomainSkipped(extDomain) {
+		log.Printf("[%s] skip-listed external domain ignored: %s", srcDomain, extDomain)
+		return
+	}
+
 	db, err := openDomainDB(srcDomain)
 	if err != nil {
 		return
@@ -925,6 +993,7 @@ func main() {
 		log.Fatalf("mkdir static: %v", err)
 	}
 
+	initSkipDB()
 	initMainDB()
 
 	// Resume domains from previous run
@@ -997,5 +1066,7 @@ func main() {
 
 	mainDB.Exec(`PRAGMA wal_checkpoint(TRUNCATE)`) //nolint:errcheck
 	mainDB.Close()
+	skipDB.Exec(`PRAGMA wal_checkpoint(TRUNCATE)`) //nolint:errcheck
+	skipDB.Close()
 	log.Println("goodbye.")
 }
