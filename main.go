@@ -164,6 +164,16 @@ func openDomainDB(domain string) (*sql.DB, error) {
 		db.Close()
 		return nil, err
 	}
+	_, err = db.Exec(`
+		CREATE TABLE IF NOT EXISTS queue (
+			id       INTEGER  PRIMARY KEY AUTOINCREMENT,
+			url      TEXT     NOT NULL UNIQUE,
+			added_at DATETIME NOT NULL
+		)`)
+	if err != nil {
+		db.Close()
+		return nil, err
+	}
 
 	domainDBsMu.Lock()
 	domainDBs[domain] = db
@@ -188,6 +198,57 @@ func isURLKnown(db *sql.DB, rawURL string) bool {
 	var c int
 	db.QueryRow(`SELECT COUNT(1) FROM urls WHERE url = ?`, rawURL).Scan(&c)
 	return c > 0
+}
+
+// ── persistent queue helpers ──────────────────────────────────────
+
+// enqueueURL adds a URL to the persistent queue if not already there
+// and not already crawled.
+func enqueueURL(db *sql.DB, rawURL string) {
+	now := time.Now().UTC().Format(time.RFC3339)
+	db.Exec(`INSERT OR IGNORE INTO queue (url, added_at) VALUES (?, ?)`, rawURL, now)
+}
+
+// dequeueURL removes and returns the oldest queued URL (FIFO).
+// Returns "", false when the queue is empty.
+func dequeueURL(db *sql.DB) (string, bool) {
+	tx, err := db.Begin()
+	if err != nil {
+		return "", false
+	}
+	defer tx.Rollback() //nolint:errcheck
+
+	var id int64
+	var rawURL string
+	err = tx.QueryRow(`SELECT id, url FROM queue ORDER BY id ASC LIMIT 1`).Scan(&id, &rawURL)
+	if err != nil {
+		return "", false // empty
+	}
+	if _, err = tx.Exec(`DELETE FROM queue WHERE id = ?`, id); err != nil {
+		return "", false
+	}
+	if err = tx.Commit(); err != nil {
+		return "", false
+	}
+	return rawURL, true
+}
+
+// queueLen returns the current number of pending URLs.
+func queueLen(db *sql.DB) int {
+	var n int
+	db.QueryRow(`SELECT COUNT(1) FROM queue`).Scan(&n)
+	return n
+}
+
+// seedQueue inserts the start URL only when the queue is completely empty
+// (first ever run). On restart the persisted queue is used as-is.
+func seedQueue(db *sql.DB, startURL string) {
+	var qCount, uCount int
+	db.QueryRow(`SELECT COUNT(1) FROM queue`).Scan(&qCount)
+	db.QueryRow(`SELECT COUNT(1) FROM urls`).Scan(&uCount)
+	if qCount == 0 && uCount == 0 {
+		enqueueURL(db, startURL)
+	}
 }
 
 // ─────────────────────────────────────────────────────────────────
@@ -312,9 +373,12 @@ func crawlDomain(domain string, intervalSec int) {
 		"effective_delay": intervalSec,
 	})
 
-	// ── BFS queue ───────────────────────────────────────────────
+	// ── Persistent BFS queue ────────────────────────────────────
+	// On first run: seed with the start URL.
+	// On restart:   the queue table already holds the pending URLs —
+	//               we just continue from where we left off.
 	startURL := "https://" + domain + "/"
-	queue := []string{startURL}
+	seedQueue(db, startURL)
 
 	httpClient := &http.Client{
 		Timeout: 30 * time.Second,
@@ -326,16 +390,20 @@ func crawlDomain(domain string, intervalSec int) {
 		},
 	}
 
-	for len(queue) > 0 {
+	for {
 		// Re-read interval in case it was updated via API
 		var cur int
 		if err := mainDB.QueryRow(`SELECT interval FROM domains WHERE domain=?`, domain).Scan(&cur); err == nil && cur > 0 {
 			intervalSec = cur
 		}
 
-		target := queue[0]
-		queue = queue[1:]
+		target, ok := dequeueURL(db)
+		if !ok {
+			break // queue exhausted
+		}
 
+		// Skip if already crawled (can happen if same URL was enqueued
+		// multiple times before being dequeued, or after a re-seed)
 		if isURLKnown(db, target) {
 			continue
 		}
@@ -356,7 +424,7 @@ func crawlDomain(domain string, intervalSec int) {
 		emit(br, "waiting", map[string]interface{}{
 			"url":     target,
 			"delay_s": delaySec,
-			"queue":   len(queue),
+			"queue":   queueLen(db),
 		})
 		time.Sleep(delay)
 
@@ -366,6 +434,8 @@ func crawlDomain(domain string, intervalSec int) {
 		if err != nil {
 			emit(br, "error", map[string]string{"url": target, "msg": err.Error()})
 			log.Printf("[%s] fetch error %s: %v", domain, target, err)
+			// Re-enqueue so it's retried next run
+			enqueueURL(db, target)
 			continue
 		}
 
@@ -389,13 +459,13 @@ func crawlDomain(domain string, intervalSec int) {
 			log.Printf("[%s] saved: %s", domain, target)
 		}
 
-		// discover links
+		// discover links from HTML pages
 		if isHTML && resp.StatusCode == 200 {
 			links := extractLinks(parsed, bodyStr)
 			newCount := 0
 			for _, link := range links {
 				if !isURLKnown(db, link) {
-					queue = append(queue, link)
+					enqueueURL(db, link)
 					newCount++
 				}
 			}
@@ -403,7 +473,7 @@ func crawlDomain(domain string, intervalSec int) {
 				"url":       target,
 				"found":     len(links),
 				"new":       newCount,
-				"queue_len": len(queue),
+				"queue_len": queueLen(db),
 			})
 		}
 	}
