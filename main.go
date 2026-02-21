@@ -35,8 +35,9 @@ var mainDB *sql.DB  // siliconpin_spider.sqlite  – domain registry
 var skipDB *sql.DB  // skip_domain_list.sqlite    – skip list
 var mariaDB *sql.DB // MariaDB                  – crawled urls / queue / ext_links
 
-// MariaDB table name (from env)
+// MariaDB table names (from env)
 var mariaTable string
+var mariaTableDomains string
 
 // SSE brokers – one per domain
 var (
@@ -185,6 +186,7 @@ func initMariaDB() {
 	pass := mustEnv("MARIA_DB_PASS")
 	dbname := mustEnv("MARIA_DB_DATABASE")
 	mariaTable = mustEnv("MARIA_DB_TABLE")
+	mariaTableDomains = mustEnv("MARIA_DB_TABLE_DOMAINS")
 
 	// DSN format: user:pass@tcp(host:port)/dbname?params
 	dsn := fmt.Sprintf("%s:%s@tcp(%s:%s)/%s", user, pass, host, port, dbname)
@@ -228,7 +230,24 @@ func initMariaDB() {
 	if _, err = mariaDB.Exec(createSQL); err != nil {
 		log.Fatalf("create MariaDB table %s: %v", mariaTable, err)
 	}
-	log.Printf("MariaDB ready: table=%s", mariaTable)
+
+	// Discovered-domains table
+	createDomainsSQL := fmt.Sprintf(`
+		CREATE TABLE IF NOT EXISTS %s (
+			id           BIGINT       NOT NULL AUTO_INCREMENT,
+			domain       VARCHAR(253) NOT NULL,
+			parent       VARCHAR(253) NOT NULL DEFAULT '',
+			interval_sec INT          NOT NULL DEFAULT 60,
+			discovered_at DATETIME    NOT NULL,
+			PRIMARY KEY (id),
+			UNIQUE KEY uq_domain (domain),
+			KEY idx_parent (parent)
+		) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`, mariaTableDomains)
+
+	if _, err = mariaDB.Exec(createDomainsSQL); err != nil {
+		log.Fatalf("create MariaDB table %s: %v", mariaTableDomains, err)
+	}
+	log.Printf("MariaDB ready: table=%s, domains_table=%s", mariaTable, mariaTableDomains)
 }
 
 // ─────────────────────────────────────────────────────────────────
@@ -452,6 +471,17 @@ func insertExtLink(srcDomain, extDomain string) bool {
 	return n > 0
 }
 
+// insertDiscoveredDomain records an auto-discovered domain in MariaDB.
+func insertDiscoveredDomain(domain, parent string, intervalSec int) {
+	now := nowStr()
+	q := fmt.Sprintf(`
+		INSERT IGNORE INTO %s (domain, parent, interval_sec, discovered_at)
+		VALUES (?, ?, ?, ?)`, mariaTableDomains)
+	if _, err := mariaDB.Exec(q, domain, parent, intervalSec, now); err != nil {
+		log.Printf("insertDiscoveredDomain %s: %v", domain, err)
+	}
+}
+
 // ─────────────────────────────────────────────────────────────────
 //  recordExtLink – discover & register external domains
 // ─────────────────────────────────────────────────────────────────
@@ -471,6 +501,7 @@ func recordExtLink(srcDomain, extDomain string, parentInterval int) {
 	}
 
 	log.Printf("[%s] discovered external domain: %s", srcDomain, extDomain)
+	insertDiscoveredDomain(extDomain, srcDomain, parentInterval)
 	broadcast("new_domain", map[string]string{
 		"domain": extDomain,
 		"parent": srcDomain,
