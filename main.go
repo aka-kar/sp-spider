@@ -26,8 +26,10 @@ import (
 //  Constants & globals
 // ─────────────────────────────────────────────────────────────────
 
-const mainDBFile = "siliconpin_spider.sqlite"
-const skipDBFile = "skip_domain_list.sqlite"
+const appDataDir = "./data/app"
+const domainDataDir = "./data/domain"
+const mainDBFile = appDataDir + "/siliconpin_spider.sqlite"
+const skipDBFile = appDataDir + "/skip_domain_list.sqlite"
 
 var mainDB *sql.DB
 var skipDB *sql.DB
@@ -295,7 +297,7 @@ func openDomainDB(domain string) (*sql.DB, error) {
 		return db, nil
 	}
 
-	db, err := sql.Open("sqlite3", domain+".sqlite?_journal=WAL&_busy_timeout=5000")
+	db, err := sql.Open("sqlite3", domainDataDir+"/"+domain+".sqlite?_journal=WAL&_busy_timeout=5000")
 	if err != nil {
 		return nil, err
 	}
@@ -844,7 +846,7 @@ func addDomainHandler(w http.ResponseWriter, r *http.Request) {
 		"message":  "domain added, crawler started",
 		"domain":   domain,
 		"interval": interval,
-		"db_file":  domain + ".sqlite",
+		"db_file":  domainDataDir + "/" + domain + ".sqlite",
 		"sse":      "/api/sse/" + domain,
 	})
 }
@@ -989,6 +991,12 @@ func broadcastAll(event string, data interface{}) {
 func main() {
 	rand.Seed(time.Now().UnixNano()) //nolint:staticcheck
 
+	if err := os.MkdirAll(appDataDir, 0o755); err != nil {
+		log.Fatalf("mkdir %s: %v", appDataDir, err)
+	}
+	if err := os.MkdirAll(domainDataDir, 0o755); err != nil {
+		log.Fatalf("mkdir %s: %v", domainDataDir, err)
+	}
 	if err := os.MkdirAll("static", 0o755); err != nil {
 		log.Fatalf("mkdir static: %v", err)
 	}
@@ -1060,7 +1068,7 @@ func main() {
 	for d, db := range domainDBs {
 		db.Exec(`PRAGMA wal_checkpoint(TRUNCATE)`) //nolint:errcheck
 		db.Close()
-		log.Printf("checkpointed %s.sqlite", d)
+		log.Printf("checkpointed %s/%s.sqlite", domainDataDir, d)
 	}
 	domainDBsMu.RUnlock()
 
