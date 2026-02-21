@@ -658,6 +658,13 @@ func crawlDomain(domain string, intervalSec int) {
 			if len(via) >= 5 {
 				return fmt.Errorf("too many redirects")
 			}
+			// If the redirect crosses to a different host, register it as an
+			// external domain so it gets discovered and crawled.
+			redirectHost := strings.TrimPrefix(strings.ToLower(req.URL.Hostname()), "www.")
+			originHost := strings.TrimPrefix(strings.ToLower(via[0].URL.Hostname()), "www.")
+			if redirectHost != "" && redirectHost != originHost && isValidDomain(redirectHost) {
+				go recordExtLink(domain, redirectHost, intervalSec)
+			}
 			return nil
 		},
 	}
