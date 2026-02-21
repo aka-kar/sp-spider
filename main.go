@@ -19,6 +19,7 @@ import (
 	"syscall"
 	"time"
 
+	_ "github.com/go-sql-driver/mysql"
 	_ "github.com/mattn/go-sqlite3"
 )
 
@@ -27,23 +28,20 @@ import (
 // ─────────────────────────────────────────────────────────────────
 
 const appDataDir = "./data/app"
-const domainDataDir = "./data/domain"
 const mainDBFile = appDataDir + "/siliconpin_spider.sqlite"
 const skipDBFile = appDataDir + "/skip_domain_list.sqlite"
 
-var mainDB *sql.DB
-var skipDB *sql.DB
+var mainDB *sql.DB  // siliconpin_spider.sqlite  – domain registry
+var skipDB *sql.DB  // skip_domain_list.sqlite    – skip list
+var mariaDB *sql.DB // MariaDB                  – crawled urls / queue / ext_links
 
-// SSE brokers  – one per domain
+// MariaDB table name (from env)
+var mariaTable string
+
+// SSE brokers – one per domain
 var (
 	brokersMu sync.RWMutex
 	brokers   = map[string]*Broker{}
-)
-
-// open domain DB handles
-var (
-	domainDBsMu sync.RWMutex
-	domainDBs   = map[string]*sql.DB{}
 )
 
 // crawler goroutine guard
@@ -53,11 +51,10 @@ var (
 )
 
 // pause/resume channels – one per domain
-// sending to pauseCh pauses; sending to resumeCh resumes
 var (
 	pauseChsMu sync.RWMutex
-	pauseChs   = map[string]chan struct{}{} // pause signal
-	resumeChs  = map[string]chan struct{}{} // resume signal
+	pauseChs   = map[string]chan struct{}{}
+	resumeChs  = map[string]chan struct{}{}
 )
 
 // domain status values stored in main DB
@@ -67,6 +64,42 @@ const (
 	statusDone    = "done"
 	statusPending = "pending"
 )
+
+// ─────────────────────────────────────────────────────────────────
+//  .env loader (minimal, no external dependency)
+// ─────────────────────────────────────────────────────────────────
+
+func loadEnv(path string) {
+	f, err := os.Open(path)
+	if err != nil {
+		return // .env is optional
+	}
+	defer f.Close()
+	scanner := bufio.NewScanner(f)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		parts := strings.SplitN(line, "=", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		key := strings.TrimSpace(parts[0])
+		val := strings.Trim(strings.TrimSpace(parts[1]), `"'`)
+		if os.Getenv(key) == "" { // don't override real env vars
+			os.Setenv(key, val)
+		}
+	}
+}
+
+func mustEnv(key string) string {
+	v := os.Getenv(key)
+	if v == "" {
+		log.Fatalf("required env var %s is not set (check .env)", key)
+	}
+	return v
+}
 
 // ─────────────────────────────────────────────────────────────────
 //  SSE Broker
@@ -131,7 +164,6 @@ func emit(br *Broker, event string, data interface{}) {
 	br.publish(string(b))
 }
 
-// broadcast emits to ALL domain brokers (e.g. for a new_domain event)
 func broadcast(event string, data interface{}) {
 	brokersMu.RLock()
 	defer brokersMu.RUnlock()
@@ -143,7 +175,64 @@ func broadcast(event string, data interface{}) {
 }
 
 // ─────────────────────────────────────────────────────────────────
-//  Main DB helpers
+//  MariaDB init
+// ─────────────────────────────────────────────────────────────────
+
+func initMariaDB() {
+	host := mustEnv("MARIA_DB_HOST")
+	port := mustEnv("MARIA_DB_PORT")
+	user := mustEnv("MARIA_DB_USER")
+	pass := mustEnv("MARIA_DB_PASS")
+	dbname := mustEnv("MARIA_DB_DATABASE")
+	mariaTable = mustEnv("MARIA_DB_TABLE")
+
+	// DSN format: user:pass@tcp(host:port)/dbname?params
+	dsn := fmt.Sprintf("%s:%s@tcp(%s:%s)/%s", user, pass, host, port, dbname)
+	var err error
+	mariaDB, err = sql.Open("mysql", dsn+"?parseTime=true&timeout=10s&readTimeout=30s&writeTimeout=30s")
+	if err != nil {
+		log.Fatalf("open MariaDB: %v", err)
+	}
+	mariaDB.SetMaxOpenConns(25)
+	mariaDB.SetMaxIdleConns(10)
+	mariaDB.SetConnMaxLifetime(5 * time.Minute)
+
+	if err = mariaDB.Ping(); err != nil {
+		log.Fatalf("ping MariaDB: %v", err)
+	}
+
+	// Create the single unified table if it doesn't exist.
+	// Three logical sections: urls, queue, ext_links – distinguished by `kind`.
+	// Layout:
+	//   kind: 'url' | 'queue' | 'ext_link'
+	//   domain: the crawled domain
+	//   value: the url or ext_domain value
+	//   status / content_type only filled for kind='url'
+	//   added_at always set
+	createSQL := fmt.Sprintf(`
+		CREATE TABLE IF NOT EXISTS %s (
+			id           BIGINT       NOT NULL AUTO_INCREMENT,
+			kind         ENUM('url','queue','ext_link') NOT NULL,
+			domain       VARCHAR(253) NOT NULL,
+			value        TEXT         NOT NULL,
+			content_type VARCHAR(255) NOT NULL DEFAULT '',
+			http_status  SMALLINT     NOT NULL DEFAULT 0,
+			created_at   DATETIME     NOT NULL,
+			updated_at   DATETIME     NOT NULL,
+			PRIMARY KEY (id),
+			UNIQUE KEY uq_kind_domain_value (kind, domain, value(512)),
+			KEY idx_domain (domain),
+			KEY idx_kind_domain (kind, domain)
+		) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`, mariaTable)
+
+	if _, err = mariaDB.Exec(createSQL); err != nil {
+		log.Fatalf("create MariaDB table %s: %v", mariaTable, err)
+	}
+	log.Printf("MariaDB ready: table=%s", mariaTable)
+}
+
+// ─────────────────────────────────────────────────────────────────
+//  Main DB (siliconpin_spider.sqlite) helpers
 // ─────────────────────────────────────────────────────────────────
 
 func initMainDB() {
@@ -185,7 +274,6 @@ func initSkipDB() {
 		log.Fatalf("create skip_domains table: %v", err)
 	}
 
-	// Seed default skip list — INSERT OR IGNORE so re-runs are safe
 	defaults := []struct{ domain, reason string }{
 		{"google.com", "analytics / search engine"},
 		{"facebook.com", "social media tracker"},
@@ -201,16 +289,12 @@ func initSkipDB() {
 	log.Printf("Skip DB ready: %s", skipDBFile)
 }
 
-// isDomainSkipped returns true if the domain (or any parent domain suffix) is
-// in the skip list.  e.g. "cdn.google.com" matches the "google.com" entry.
 func isDomainSkipped(domain string) bool {
-	// exact match
 	var c int
 	skipDB.QueryRow(`SELECT COUNT(1) FROM skip_domains WHERE domain = ?`, domain).Scan(&c)
 	if c > 0 {
 		return true
 	}
-	// suffix match: check if domain ends with "."+skipEntry
 	rows, err := skipDB.Query(`SELECT domain FROM skip_domains`)
 	if err != nil {
 		return false
@@ -261,18 +345,13 @@ func listDomains() ([]DomainRow, error) {
 			&d.Parent, &d.CreatedAt, &d.UpdatedAt); err != nil {
 			continue
 		}
-		// get live counts from domain DB
-		if db, err2 := openDomainDB(d.Domain); err2 == nil {
-			db.QueryRow(`SELECT COUNT(1) FROM urls`).Scan(&d.URLCount)
-			db.QueryRow(`SELECT COUNT(1) FROM queue`).Scan(&d.QueueLen)
-		}
+		d.URLCount = mariaCount("url", d.Domain)
+		d.QueueLen = mariaCount("queue", d.Domain)
 		out = append(out, d)
 	}
 	return out, nil
 }
 
-// registerDomain upserts a domain in the main DB.
-// parentDomain is "" for user-added domains, otherwise the domain that found it.
 func registerDomain(domain string, interval int, parentDomain string) error {
 	now := time.Now().UTC().Format(time.RFC3339)
 	_, err := mainDB.Exec(`
@@ -286,93 +365,64 @@ func registerDomain(domain string, interval int, parentDomain string) error {
 }
 
 // ─────────────────────────────────────────────────────────────────
-//  Domain DB helpers
+//  MariaDB domain-data helpers (replaces per-domain SQLite files)
 // ─────────────────────────────────────────────────────────────────
 
-func openDomainDB(domain string) (*sql.DB, error) {
-	domainDBsMu.RLock()
-	db, ok := domainDBs[domain]
-	domainDBsMu.RUnlock()
-	if ok {
-		return db, nil
-	}
+func nowStr() string { return time.Now().UTC().Format("2006-01-02 15:04:05") }
 
-	db, err := sql.Open("sqlite3", domainDataDir+"/"+domain+".sqlite?_journal=WAL&_busy_timeout=5000")
-	if err != nil {
-		return nil, err
-	}
-	if _, err = db.Exec(`
-		CREATE TABLE IF NOT EXISTS urls (
-			id         INTEGER  PRIMARY KEY AUTOINCREMENT,
-			url        TEXT     NOT NULL UNIQUE,
-			created_at DATETIME NOT NULL,
-			updated_at DATETIME NOT NULL
-		)`); err != nil {
-		db.Close()
-		return nil, err
-	}
-	if _, err = db.Exec(`
-		CREATE TABLE IF NOT EXISTS queue (
-			id       INTEGER  PRIMARY KEY AUTOINCREMENT,
-			url      TEXT     NOT NULL UNIQUE,
-			added_at DATETIME NOT NULL
-		)`); err != nil {
-		db.Close()
-		return nil, err
-	}
-	// cross-domain links discovered during crawl
-	if _, err = db.Exec(`
-		CREATE TABLE IF NOT EXISTS ext_links (
-			id         INTEGER  PRIMARY KEY AUTOINCREMENT,
-			ext_domain TEXT     NOT NULL UNIQUE,
-			found_at   DATETIME NOT NULL
-		)`); err != nil {
-		db.Close()
-		return nil, err
-	}
-
-	domainDBsMu.Lock()
-	domainDBs[domain] = db
-	domainDBsMu.Unlock()
-	return db, nil
+func mariaCount(kind, domain string) int {
+	var n int
+	q := fmt.Sprintf(`SELECT COUNT(1) FROM %s WHERE kind=? AND domain=?`, mariaTable)
+	mariaDB.QueryRow(q, kind, domain).Scan(&n)
+	return n
 }
 
-func insertURL(db *sql.DB, rawURL string) (bool, error) {
-	now := time.Now().UTC().Format(time.RFC3339)
-	res, err := db.Exec(
-		`INSERT OR IGNORE INTO urls (url, created_at, updated_at) VALUES (?, ?, ?)`,
-		rawURL, now, now)
+// insertURL inserts a crawled URL. Returns true if it was new.
+func insertURL(domain, rawURL, contentType string, httpStatus int) (bool, error) {
+	now := nowStr()
+	q := fmt.Sprintf(`
+		INSERT INTO %s (kind, domain, value, content_type, http_status, created_at, updated_at)
+		VALUES ('url', ?, ?, ?, ?, ?, ?)
+		ON DUPLICATE KEY UPDATE updated_at=VALUES(updated_at)`, mariaTable)
+	res, err := mariaDB.Exec(q, domain, rawURL, contentType, httpStatus, now, now)
 	if err != nil {
 		return false, err
 	}
 	n, _ := res.RowsAffected()
-	return n > 0, nil
+	// MySQL: INSERT … ON DUPLICATE KEY UPDATE returns 1 for insert, 2 for update, 0 for no-op
+	return n == 1, nil
 }
 
-func isURLKnown(db *sql.DB, rawURL string) bool {
+func isURLKnown(domain, rawURL string) bool {
 	var c int
-	db.QueryRow(`SELECT COUNT(1) FROM urls WHERE url = ?`, rawURL).Scan(&c)
+	q := fmt.Sprintf(`SELECT COUNT(1) FROM %s WHERE kind='url' AND domain=? AND value=?`, mariaTable)
+	mariaDB.QueryRow(q, domain, rawURL).Scan(&c)
 	return c > 0
 }
 
-func enqueueURL(db *sql.DB, rawURL string) {
-	now := time.Now().UTC().Format(time.RFC3339)
-	db.Exec(`INSERT OR IGNORE INTO queue (url, added_at) VALUES (?, ?)`, rawURL, now)
+func enqueueURL(domain, rawURL string) {
+	now := nowStr()
+	q := fmt.Sprintf(`
+		INSERT IGNORE INTO %s (kind, domain, value, created_at, updated_at)
+		VALUES ('queue', ?, ?, ?, ?)`, mariaTable)
+	mariaDB.Exec(q, domain, rawURL, now, now)
 }
 
-func dequeueURL(db *sql.DB) (string, bool) {
-	tx, err := db.Begin()
+func dequeueURL(domain string) (string, bool) {
+	tx, err := mariaDB.Begin()
 	if err != nil {
 		return "", false
 	}
 	defer tx.Rollback() //nolint:errcheck
+
 	var id int64
 	var rawURL string
-	if err = tx.QueryRow(`SELECT id, url FROM queue ORDER BY id ASC LIMIT 1`).
-		Scan(&id, &rawURL); err != nil {
+	q := fmt.Sprintf(`SELECT id, value FROM %s WHERE kind='queue' AND domain=? ORDER BY id ASC LIMIT 1 FOR UPDATE`, mariaTable)
+	if err = tx.QueryRow(q, domain).Scan(&id, &rawURL); err != nil {
 		return "", false
 	}
-	if _, err = tx.Exec(`DELETE FROM queue WHERE id = ?`, id); err != nil {
+	dq := fmt.Sprintf(`DELETE FROM %s WHERE id=?`, mariaTable)
+	if _, err = tx.Exec(dq, id); err != nil {
 		return "", false
 	}
 	if err = tx.Commit(); err != nil {
@@ -381,61 +431,50 @@ func dequeueURL(db *sql.DB) (string, bool) {
 	return rawURL, true
 }
 
-func queueLen(db *sql.DB) int {
-	var n int
-	db.QueryRow(`SELECT COUNT(1) FROM queue`).Scan(&n)
-	return n
+func queueLen(domain string) int {
+	return mariaCount("queue", domain)
 }
 
-func seedQueue(db *sql.DB, startURL string) {
-	var qc, uc int
-	db.QueryRow(`SELECT COUNT(1) FROM queue`).Scan(&qc)
-	db.QueryRow(`SELECT COUNT(1) FROM urls`).Scan(&uc)
-	if qc == 0 && uc == 0 {
-		enqueueURL(db, startURL)
+func seedQueue(domain, startURL string) {
+	if mariaCount("queue", domain) == 0 && mariaCount("url", domain) == 0 {
+		enqueueURL(domain, startURL)
 	}
 }
 
-// recordExtLink saves a discovered external domain and auto-registers it.
+// insertExtLink records a discovered external domain. Returns true if new.
+func insertExtLink(srcDomain, extDomain string) bool {
+	now := nowStr()
+	q := fmt.Sprintf(`
+		INSERT IGNORE INTO %s (kind, domain, value, created_at, updated_at)
+		VALUES ('ext_link', ?, ?, ?, ?)`, mariaTable)
+	res, _ := mariaDB.Exec(q, srcDomain, extDomain, now, now)
+	n, _ := res.RowsAffected()
+	return n > 0
+}
+
+// ─────────────────────────────────────────────────────────────────
+//  recordExtLink – discover & register external domains
+// ─────────────────────────────────────────────────────────────────
+
 func recordExtLink(srcDomain, extDomain string, parentInterval int) {
-	// Skip domains on the block list (and their subdomains)
 	if isDomainSkipped(extDomain) {
 		log.Printf("[%s] skip-listed external domain ignored: %s", srcDomain, extDomain)
 		return
 	}
-
-	db, err := openDomainDB(srcDomain)
-	if err != nil {
-		return
-	}
-	now := time.Now().UTC().Format(time.RFC3339)
-	res, _ := db.Exec(
-		`INSERT OR IGNORE INTO ext_links (ext_domain, found_at) VALUES (?, ?)`,
-		extDomain, now)
-	n, _ := res.RowsAffected()
-	if n == 0 {
+	if !insertExtLink(srcDomain, extDomain) {
 		return // already recorded
 	}
 
-	// Register in main DB (inherit parent's interval)
 	if err := registerDomain(extDomain, parentInterval, srcDomain); err != nil {
 		log.Printf("registerDomain %s (from %s): %v", extDomain, srcDomain, err)
 		return
 	}
 
 	log.Printf("[%s] discovered external domain: %s", srcDomain, extDomain)
-
-	// Notify UI
 	broadcast("new_domain", map[string]string{
 		"domain": extDomain,
 		"parent": srcDomain,
 	})
-
-	// Init the new domain's DB and start its crawler
-	if _, err := openDomainDB(extDomain); err != nil {
-		log.Printf("openDomainDB %s: %v", extDomain, err)
-		return
-	}
 
 	crawlersMu.Lock()
 	if !crawlers[extDomain] {
@@ -458,7 +497,6 @@ func ensurePauseChannels(domain string) {
 	}
 }
 
-// pauseCrawler signals the crawler to pause. Non-blocking.
 func pauseCrawler(domain string) {
 	pauseChsMu.RLock()
 	ch, ok := pauseChs[domain]
@@ -472,7 +510,6 @@ func pauseCrawler(domain string) {
 	}
 }
 
-// resumeCrawler signals a paused crawler to continue. Non-blocking.
 func resumeCrawler(domain string) {
 	pauseChsMu.RLock()
 	ch, ok := resumeChs[domain]
@@ -486,9 +523,8 @@ func resumeCrawler(domain string) {
 	}
 }
 
-// checkPause is called inside the crawl loop between requests.
-// If a pause signal is pending (or already buffered) it blocks until resume.
-// Returns true if the crawler was paused (and has now resumed).
+// checkPause checks for a pending pause signal and blocks until resumed.
+// Returns true if a pause-then-resume cycle happened.
 func checkPause(domain string, br *Broker) bool {
 	pauseChsMu.RLock()
 	pCh := pauseChs[domain]
@@ -497,14 +533,12 @@ func checkPause(domain string, br *Broker) bool {
 
 	select {
 	case <-pCh:
-		// drain any stacked-up duplicate signals
 		for len(pCh) > 0 {
 			<-pCh
 		}
 		setDomainStatus(domain, statusPaused)
 		emit(br, "paused", map[string]string{"domain": domain})
 		log.Printf("[%s] paused", domain)
-		// block until resume signal arrives
 		<-rCh
 		setDomainStatus(domain, statusRunning)
 		emit(br, "resumed", map[string]string{"domain": domain})
@@ -515,9 +549,8 @@ func checkPause(domain string, br *Broker) bool {
 	}
 }
 
-// interruptibleSleep sleeps for d but wakes up immediately if a pause signal
-// arrives. Returns true if it was interrupted by a pause (caller should re-queue
-// the current URL and continue the loop so checkPause can block properly).
+// interruptibleSleep sleeps for d but wakes immediately on a pause signal.
+// Returns true if interrupted (caller should re-queue URL and continue).
 func interruptibleSleep(domain string, br *Broker, d time.Duration) bool {
 	pauseChsMu.RLock()
 	pCh := pauseChs[domain]
@@ -529,7 +562,6 @@ func interruptibleSleep(domain string, br *Broker, d time.Duration) bool {
 	case <-timer.C:
 		return false
 	case <-pCh:
-		// drain duplicates then block until resumed
 		for len(pCh) > 0 {
 			<-pCh
 		}
@@ -611,7 +643,7 @@ var hrefRe = regexp.MustCompile(`(?i)href=["']([^"'#][^"']*)["']`)
 
 type extractedLinks struct {
 	sameHost []string
-	external []string // distinct external hostnames (not full URLs)
+	external []string
 }
 
 func extractLinks(base *url.URL, body string) extractedLinks {
@@ -641,7 +673,6 @@ func extractLinks(base *url.URL, body string) extractedLinks {
 				result.sameHost = append(result.sameHost, s)
 			}
 		} else {
-			// strip www. for normalisation
 			extDomain := strings.TrimPrefix(host, "www.")
 			if extDomain != "" && !seenExt[extDomain] && isValidDomain(extDomain) {
 				seenExt[extDomain] = true
@@ -661,15 +692,11 @@ func crawlDomain(domain string, intervalSec int) {
 	br := getBroker(domain)
 	ensurePauseChannels(domain)
 
-	db, err := openDomainDB(domain)
-	if err != nil {
-		emit(br, "error", map[string]string{"msg": "DB open failed: " + err.Error()})
-		return
-	}
+	// checkPause immediately – handles the pre-loaded pause signal on restart
+	checkPause(domain, br)
 
 	setDomainStatus(domain, statusRunning)
 
-	// robots.txt
 	emit(br, "status", map[string]string{"msg": "fetching robots.txt"})
 	robots := fetchRobots(domain)
 	if robots.crawlDelay > intervalSec {
@@ -685,7 +712,7 @@ func crawlDomain(domain string, intervalSec int) {
 	})
 
 	startURL := "https://" + domain + "/"
-	seedQueue(db, startURL)
+	seedQueue(domain, startURL)
 
 	httpClient := &http.Client{
 		Timeout: 30 * time.Second,
@@ -715,12 +742,12 @@ func crawlDomain(domain string, intervalSec int) {
 			intervalSec = cur
 		}
 
-		target, ok := dequeueURL(db)
+		target, ok := dequeueURL(domain)
 		if !ok {
 			break
 		}
 
-		if isURLKnown(db, target) {
+		if isURLKnown(domain, target) {
 			continue
 		}
 
@@ -738,11 +765,11 @@ func crawlDomain(domain string, intervalSec int) {
 		emit(br, "waiting", map[string]interface{}{
 			"url":     target,
 			"delay_s": delaySec,
-			"queue":   queueLen(db),
+			"queue":   queueLen(domain),
 		})
 		if paused := interruptibleSleep(domain, br, time.Duration(delaySec)*time.Second); paused {
 			// put the URL back so it is retried after resume
-			enqueueURL(db, target)
+			enqueueURL(domain, target)
 			continue
 		}
 
@@ -751,7 +778,7 @@ func crawlDomain(domain string, intervalSec int) {
 		if err != nil {
 			emit(br, "error", map[string]string{"url": target, "msg": err.Error()})
 			log.Printf("[%s] fetch error %s: %v", domain, target, err)
-			enqueueURL(db, target) // retry next run
+			enqueueURL(domain, target) // retry next run
 			continue
 		}
 
@@ -765,7 +792,7 @@ func crawlDomain(domain string, intervalSec int) {
 		}
 		resp.Body.Close()
 
-		if ins, _ := insertURL(db, target); ins {
+		if ins, _ := insertURL(domain, target, ct, resp.StatusCode); ins {
 			emit(br, "saved", map[string]interface{}{
 				"url":          target,
 				"status":       resp.StatusCode,
@@ -777,11 +804,10 @@ func crawlDomain(domain string, intervalSec int) {
 		if isHTML && resp.StatusCode == 200 {
 			links := extractLinks(parsed, bodyStr)
 
-			// same-host links → queue
 			newCount := 0
 			for _, link := range links.sameHost {
-				if !isURLKnown(db, link) {
-					enqueueURL(db, link)
+				if !isURLKnown(domain, link) {
+					enqueueURL(domain, link)
 					newCount++
 				}
 			}
@@ -789,11 +815,10 @@ func crawlDomain(domain string, intervalSec int) {
 				"url":       target,
 				"found":     len(links.sameHost),
 				"new":       newCount,
-				"queue_len": queueLen(db),
+				"queue_len": queueLen(domain),
 				"external":  len(links.external),
 			})
 
-			// external domains → auto-register & crawl
 			for _, extDomain := range links.external {
 				recordExtLink(domain, extDomain, intervalSec)
 			}
@@ -871,10 +896,6 @@ func addDomainHandler(w http.ResponseWriter, r *http.Request) {
 		jsonOK(w, http.StatusInternalServerError, map[string]string{"error": "db error"})
 		return
 	}
-	if _, err := openDomainDB(domain); err != nil {
-		jsonOK(w, http.StatusInternalServerError, map[string]string{"error": "domain DB init failed"})
-		return
-	}
 
 	crawlersMu.Lock()
 	if !crawlers[domain] {
@@ -889,7 +910,6 @@ func addDomainHandler(w http.ResponseWriter, r *http.Request) {
 		"message":  "domain added, crawler started",
 		"domain":   domain,
 		"interval": interval,
-		"db_file":  domainDataDir + "/" + domain + ".sqlite",
 		"sse":      "/api/sse/" + domain,
 	})
 }
@@ -951,7 +971,7 @@ func resumeHandler(w http.ResponseWriter, r *http.Request) {
 	jsonOK(w, http.StatusOK, map[string]string{"message": "resume signal sent", "domain": domain})
 }
 
-// GET /api/sse/{domain}   — or /api/sse/  (global stream for all domains)
+// GET /api/sse/{domain}  – or /api/sse/ (global)
 func sseHandler(w http.ResponseWriter, r *http.Request) {
 	rawDomain := strings.TrimPrefix(r.URL.Path, "/api/sse/")
 	rawDomain = strings.TrimRight(rawDomain, "/")
@@ -967,8 +987,6 @@ func sseHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("X-Accel-Buffering", "no")
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 
-	// If no domain specified, subscribe to the global "__all__" broker
-	// which receives broadcasts (new_domain, shutdown, etc.)
 	domainKey := rawDomain
 	if domainKey == "" {
 		domainKey = "__all__"
@@ -1007,24 +1025,11 @@ func sseHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 // ─────────────────────────────────────────────────────────────────
-//  broadcast helper – publish to __all__ broker
+//  init – ensure global SSE broker exists
 // ─────────────────────────────────────────────────────────────────
 
 func init() {
-	// ensure the global broadcast broker always exists
 	getBroker("__all__")
-}
-
-// override broadcast to also send to __all__
-func broadcastAll(event string, data interface{}) {
-	b, _ := json.Marshal(ssePayload{Event: event, Data: data})
-	msg := string(b)
-
-	brokersMu.RLock()
-	defer brokersMu.RUnlock()
-	for _, br := range brokers {
-		br.publish(msg)
-	}
 }
 
 // ─────────────────────────────────────────────────────────────────
@@ -1034,11 +1039,10 @@ func broadcastAll(event string, data interface{}) {
 func main() {
 	rand.Seed(time.Now().UnixNano()) //nolint:staticcheck
 
+	loadEnv(".env")
+
 	if err := os.MkdirAll(appDataDir, 0o755); err != nil {
 		log.Fatalf("mkdir %s: %v", appDataDir, err)
-	}
-	if err := os.MkdirAll(domainDataDir, 0o755); err != nil {
-		log.Fatalf("mkdir %s: %v", domainDataDir, err)
 	}
 	if err := os.MkdirAll("static", 0o755); err != nil {
 		log.Fatalf("mkdir static: %v", err)
@@ -1046,6 +1050,7 @@ func main() {
 
 	initSkipDB()
 	initMainDB()
+	initMariaDB()
 
 	// Resume domains from previous run
 	rows, err := mainDB.Query(`SELECT domain, interval, status FROM domains`)
@@ -1113,14 +1118,7 @@ func main() {
 	brokersMu.RUnlock()
 	time.Sleep(500 * time.Millisecond)
 
-	domainDBsMu.RLock()
-	for d, db := range domainDBs {
-		db.Exec(`PRAGMA wal_checkpoint(TRUNCATE)`) //nolint:errcheck
-		db.Close()
-		log.Printf("checkpointed %s/%s.sqlite", domainDataDir, d)
-	}
-	domainDBsMu.RUnlock()
-
+	mariaDB.Close()
 	mainDB.Exec(`PRAGMA wal_checkpoint(TRUNCATE)`) //nolint:errcheck
 	mainDB.Close()
 	skipDB.Exec(`PRAGMA wal_checkpoint(TRUNCATE)`) //nolint:errcheck
