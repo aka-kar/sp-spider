@@ -51,6 +51,10 @@ var (
 	crawlers   = map[string]bool{}
 )
 
+// crawlerSem is a buffered channel used as a semaphore to cap concurrent crawlers.
+// Initialised in main() from MAX_CRAWLERS env var (default 10).
+var crawlerSem chan struct{}
+
 // shutdown coordination
 var (
 	shutdownCtx    context.Context
@@ -490,6 +494,33 @@ func insertDiscoveredDomain(domain, parent string, intervalSec int) {
 }
 
 // ─────────────────────────────────────────────────────────────────
+//  Crawler slot management
+// ─────────────────────────────────────────────────────────────────
+
+// tryStartCrawler launches crawlDomain if no goroutine is already running for
+// the domain AND a semaphore slot is available. Returns true if launched.
+func tryStartCrawler(domain string, intervalSec int) bool {
+	crawlersMu.Lock()
+	defer crawlersMu.Unlock()
+	if crawlers[domain] {
+		return false // already running
+	}
+	select {
+	case crawlerSem <- struct{}{}: // slot acquired
+	default:
+		log.Printf("[%s] max crawlers reached, queued as pending", domain)
+		return false // no slot available; stays pending in DB
+	}
+	crawlers[domain] = true
+	crawlerWg.Add(1)
+	go func() {
+		defer func() { <-crawlerSem }() // release slot when done
+		crawlDomain(shutdownCtx, domain, intervalSec)
+	}()
+	return true
+}
+
+// ─────────────────────────────────────────────────────────────────
 //  recordExtLink – discover & register external domains
 // ─────────────────────────────────────────────────────────────────
 
@@ -514,13 +545,7 @@ func recordExtLink(srcDomain, extDomain string, parentInterval int) {
 		"parent": srcDomain,
 	})
 
-	crawlersMu.Lock()
-	if !crawlers[extDomain] {
-		crawlers[extDomain] = true
-		crawlerWg.Add(1)
-		go crawlDomain(shutdownCtx, extDomain, parentInterval)
-	}
-	crawlersMu.Unlock()
+	tryStartCrawler(extDomain, parentInterval)
 }
 
 // ─────────────────────────────────────────────────────────────────
@@ -947,13 +972,7 @@ func addDomainHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	crawlersMu.Lock()
-	if !crawlers[domain] {
-		crawlers[domain] = true
-		crawlerWg.Add(1)
-		go crawlDomain(shutdownCtx, domain, interval)
-	}
-	crawlersMu.Unlock()
+	tryStartCrawler(domain, interval)
 
 	broadcast("new_domain", map[string]string{"domain": domain, "parent": ""})
 
@@ -1094,6 +1113,17 @@ func main() {
 
 	shutdownCtx, shutdownCancel = context.WithCancel(context.Background())
 
+	// Semaphore: cap concurrent crawlers via MAX_CRAWLERS env (default 10)
+	maxCrawlers := 10
+	if v := os.Getenv("MAX_CRAWLERS"); v != "" {
+		fmt.Sscanf(v, "%d", &maxCrawlers)
+		if maxCrawlers < 1 {
+			maxCrawlers = 1
+		}
+	}
+	crawlerSem = make(chan struct{}, maxCrawlers)
+	log.Printf("max concurrent crawlers: %d", maxCrawlers)
+
 	if err := os.MkdirAll(appDataDir, 0o755); err != nil {
 		log.Fatalf("mkdir %s: %v", appDataDir, err)
 	}
@@ -1104,6 +1134,35 @@ func main() {
 	initSkipDB()
 	initMainDB()
 	initMariaDB()
+
+	// Dispatcher: periodically picks up pending domains and starts crawlers
+	// when semaphore slots become free (handles overflow from auto-discovery).
+	go func() {
+		ticker := time.NewTicker(5 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-shutdownCtx.Done():
+				return
+			case <-ticker.C:
+				rows, err := mainDB.Query(
+					`SELECT domain, interval FROM domains WHERE status=? ORDER BY id ASC`,
+					statusPending)
+				if err != nil {
+					continue
+				}
+				for rows.Next() {
+					var d string
+					var iv int
+					if rows.Scan(&d, &iv) != nil {
+						continue
+					}
+					tryStartCrawler(d, iv)
+				}
+				rows.Close()
+			}
+		}
+	}()
 
 	// Resume domains from previous run
 	rows, err := mainDB.Query(`SELECT domain, interval, status FROM domains`)
@@ -1119,21 +1178,15 @@ func main() {
 			if status == statusDone {
 				continue
 			}
-			crawlersMu.Lock()
-			if !crawlers[d] {
-				crawlers[d] = true
-				if status == statusPaused {
-					// Pre-load a pause signal before the goroutine starts so
-					// the crawler immediately blocks in its pause state.
-					ensurePauseChannels(d)
-					pauseCrawler(d)
-				} else {
-					setDomainStatus(d, statusPending)
-				}
-				crawlerWg.Add(1)
-				go crawlDomain(shutdownCtx, d, iv)
+			if status == statusPaused {
+				// Pre-load pause signal so the crawler immediately blocks.
+				ensurePauseChannels(d)
+				pauseCrawler(d)
+				tryStartCrawler(d, iv) // paused crawlers still consume a slot
+			} else {
+				setDomainStatus(d, statusPending)
+				tryStartCrawler(d, iv)
 			}
-			crawlersMu.Unlock()
 		}
 		rows.Close()
 	}
