@@ -51,6 +51,13 @@ var (
 	crawlers   = map[string]bool{}
 )
 
+// shutdown coordination
+var (
+	shutdownCtx    context.Context
+	shutdownCancel context.CancelFunc
+	crawlerWg      sync.WaitGroup
+)
+
 // pause/resume channels – one per domain
 var (
 	pauseChsMu sync.RWMutex
@@ -510,7 +517,8 @@ func recordExtLink(srcDomain, extDomain string, parentInterval int) {
 	crawlersMu.Lock()
 	if !crawlers[extDomain] {
 		crawlers[extDomain] = true
-		go crawlDomain(extDomain, parentInterval)
+		crawlerWg.Add(1)
+		go crawlDomain(shutdownCtx, extDomain, parentInterval)
 	}
 	crawlersMu.Unlock()
 }
@@ -580,9 +588,9 @@ func checkPause(domain string, br *Broker) bool {
 	}
 }
 
-// interruptibleSleep sleeps for d but wakes immediately on a pause signal.
+// interruptibleSleep sleeps for d but wakes immediately on a pause or shutdown signal.
 // Returns true if interrupted (caller should re-queue URL and continue).
-func interruptibleSleep(domain string, br *Broker, d time.Duration) bool {
+func interruptibleSleep(ctx context.Context, domain string, br *Broker, d time.Duration) bool {
 	pauseChsMu.RLock()
 	pCh := pauseChs[domain]
 	pauseChsMu.RUnlock()
@@ -590,6 +598,8 @@ func interruptibleSleep(domain string, br *Broker, d time.Duration) bool {
 	timer := time.NewTimer(d)
 	defer timer.Stop()
 	select {
+	case <-ctx.Done():
+		return true // treat shutdown as interrupt; caller will re-queue and exit on next loop check
 	case <-timer.C:
 		return false
 	case <-pCh:
@@ -718,7 +728,8 @@ func extractLinks(base *url.URL, body string) extractedLinks {
 //  Crawler goroutine
 // ─────────────────────────────────────────────────────────────────
 
-func crawlDomain(domain string, intervalSec int) {
+func crawlDomain(ctx context.Context, domain string, intervalSec int) {
+	defer crawlerWg.Done()
 	log.Printf("[%s] crawler started (interval %ds)", domain, intervalSec)
 	br := getBroker(domain)
 	ensurePauseChannels(domain)
@@ -763,6 +774,14 @@ func crawlDomain(domain string, intervalSec int) {
 	}
 
 	for {
+		// ── shutdown check ─────────────────────────────────────
+		select {
+		case <-ctx.Done():
+			log.Printf("[%s] crawler stopping (shutdown)", domain)
+			setDomainStatus(domain, statusPaused)
+			return
+		default:
+		}
 		// ── pause check ─────────────────────────────────────────
 		checkPause(domain, br)
 
@@ -798,7 +817,7 @@ func crawlDomain(domain string, intervalSec int) {
 			"delay_s": delaySec,
 			"queue":   queueLen(domain),
 		})
-		if paused := interruptibleSleep(domain, br, time.Duration(delaySec)*time.Second); paused {
+		if paused := interruptibleSleep(ctx, domain, br, time.Duration(delaySec)*time.Second); paused {
 			// put the URL back so it is retried after resume
 			enqueueURL(domain, target)
 			continue
@@ -931,7 +950,8 @@ func addDomainHandler(w http.ResponseWriter, r *http.Request) {
 	crawlersMu.Lock()
 	if !crawlers[domain] {
 		crawlers[domain] = true
-		go crawlDomain(domain, interval)
+		crawlerWg.Add(1)
+		go crawlDomain(shutdownCtx, domain, interval)
 	}
 	crawlersMu.Unlock()
 
@@ -1072,6 +1092,8 @@ func main() {
 
 	loadEnv(".env")
 
+	shutdownCtx, shutdownCancel = context.WithCancel(context.Background())
+
 	if err := os.MkdirAll(appDataDir, 0o755); err != nil {
 		log.Fatalf("mkdir %s: %v", appDataDir, err)
 	}
@@ -1108,7 +1130,8 @@ func main() {
 				} else {
 					setDomainStatus(d, statusPending)
 				}
-				go crawlDomain(d, iv)
+				crawlerWg.Add(1)
+				go crawlDomain(shutdownCtx, d, iv)
 			}
 			crawlersMu.Unlock()
 		}
@@ -1138,17 +1161,33 @@ func main() {
 	<-quit
 	log.Println("shutting down…")
 
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	srv.Shutdown(ctx) //nolint:errcheck
+	// 1. Signal all crawler goroutines to stop
+	shutdownCancel()
 
+	// 2. Stop accepting new HTTP requests
+	httpCtx, httpCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer httpCancel()
+	srv.Shutdown(httpCtx) //nolint:errcheck
+
+	// 3. Notify SSE clients
 	brokersMu.RLock()
 	for d, br := range brokers {
 		emit(br, "shutdown", map[string]string{"domain": d, "msg": "server stopping"})
 	}
 	brokersMu.RUnlock()
-	time.Sleep(500 * time.Millisecond)
 
+	// 4. Wait for all crawler goroutines to exit (max 30s)
+	log.Println("waiting for crawlers to stop…")
+	done := make(chan struct{})
+	go func() { crawlerWg.Wait(); close(done) }()
+	select {
+	case <-done:
+		log.Println("all crawlers stopped")
+	case <-time.After(30 * time.Second):
+		log.Println("timed out waiting for crawlers; forcing shutdown")
+	}
+
+	// 5. Now safe to close DBs
 	mariaDB.Close()
 	mainDB.Exec(`PRAGMA wal_checkpoint(TRUNCATE)`) //nolint:errcheck
 	mainDB.Close()
