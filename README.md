@@ -40,6 +40,25 @@ go run main.go
 
 ---
 
+## Domain Statuses
+
+The `siliconpin_spider.sqlite` registry tracks each domain with one of these statuses:
+
+| Status | Description |
+|--------|-------------|
+| `pending` | Domain is queued and waiting to start crawling |
+| `running` | Actively crawling the domain (fetching URLs, following links) |
+| `paused` | Crawling is temporarily paused (can be resumed) |
+| `done` | Crawling completed (no more URLs to process) |
+
+**Status Transitions:**
+- `pending` → `running` (when crawler starts)
+- `running` → `paused` (manual pause or shutdown)
+- `paused` → `running` (manual resume)
+- `running` → `done` (crawl completes naturally)
+
+---
+
 ## API
 
 ### `POST /api/add_domain`
@@ -49,7 +68,21 @@ Register a domain and immediately start crawling it.
 ```bash
 curl -X POST http://localhost:8080/api/add_domain \
   -H "Content-Type: application/json" \
-  -d '{"domain":"siliconpin.com","Crawl-delay":"20"}'
+  -d '{"domain":"siliconpin.com","Crawl-delay":"20","internal_domain":"1","external_domain":"1"}'
+```
+
+**Example: Crawl only internal links**
+```bash
+curl -X POST http://localhost:8080/api/add_domain \
+  -H "Content-Type: application/json" \
+  -d '{"domain":"siliconpin.com","internal_domain":"1"}'
+```
+
+**Example: Discover external domains only**
+```bash
+curl -X POST http://localhost:8080/api/add_domain \
+  -H "Content-Type: application/json" \
+  -d '{"domain":"siliconpin.com","external_domain":"1"}'
 ```
 
 **Body fields**
@@ -58,6 +91,8 @@ curl -X POST http://localhost:8080/api/add_domain \
 |-------|----------|---------|-------|
 | `domain` | ✅ | — | bare domain, scheme/www stripped automatically |
 | `Crawl-delay` | ❌ | `60` | seconds; actual delay is random in `[N, N*2]` |
+| `internal_domain` | ❌ | `0` | `1` to crawl internal links, `0` to skip |
+| `external_domain` | ❌ | `0` | `1` to discover external domains, `0` to skip |
 
 **Response `201`**
 

@@ -42,8 +42,10 @@ func addDomainHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var body struct {
-		Domain     string `json:"domain"`
-		CrawlDelay string `json:"Crawl-delay"`
+		Domain         string `json:"domain"`
+		CrawlDelay     string `json:"Crawl-delay"`
+		InternalDomain string `json:"internal_domain"`
+		ExternalDomain string `json:"external_domain"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		jsonOK(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON"})
@@ -58,6 +60,12 @@ func addDomainHandler(w http.ResponseWriter, r *http.Request) {
 		jsonOK(w, http.StatusBadRequest, map[string]string{"error": "invalid domain"})
 		return
 	}
+
+	// Check if domain is in skip list
+	if isDomainSkipped(domain) {
+		jsonOK(w, http.StatusForbidden, map[string]string{"error": "domain is in skip list"})
+		return
+	}
 	interval := 60
 	if body.CrawlDelay != "" {
 		fmt.Sscanf(body.CrawlDelay, "%d", &interval)
@@ -66,7 +74,17 @@ func addDomainHandler(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	if err := registerDomain(domain, interval, ""); err != nil {
+	internal := 0
+	if body.InternalDomain != "" {
+		fmt.Sscanf(body.InternalDomain, "%d", &internal)
+	}
+
+	external := 0
+	if body.ExternalDomain != "" {
+		fmt.Sscanf(body.ExternalDomain, "%d", &external)
+	}
+
+	if err := registerDomain(domain, interval, "", internal, external); err != nil {
 		jsonOK(w, http.StatusInternalServerError, map[string]string{"error": "db error"})
 		return
 	}

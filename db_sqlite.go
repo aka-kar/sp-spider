@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"log"
 	"strings"
+	"sync"
 	"time"
 
 	_ "github.com/mattn/go-sqlite3"
@@ -12,6 +13,8 @@ import (
 // ─────────────────────────────────────────────────────────────────
 //  Main DB – siliconpin_spider.sqlite (domain registry)
 // ─────────────────────────────────────────────────────────────────
+
+var mainDBMu sync.Mutex
 
 func initMainDB() {
 	var err error
@@ -26,16 +29,26 @@ func initMainDB() {
 			interval   INTEGER  NOT NULL DEFAULT 60,
 			status     TEXT     NOT NULL DEFAULT 'pending',
 			parent     TEXT     NOT NULL DEFAULT '',
+			internal   INTEGER  NOT NULL DEFAULT 0,
+			external   INTEGER  NOT NULL DEFAULT 0,
 			created_at DATETIME NOT NULL,
 			updated_at DATETIME NOT NULL
 		)`)
 	if err != nil {
 		log.Fatalf("create domains table: %v", err)
 	}
+
+	// Add new columns to existing tables if they don't exist
+	mainDB.Exec(`ALTER TABLE domains ADD COLUMN internal INTEGER NOT NULL DEFAULT 0`) //nolint:errcheck
+	mainDB.Exec(`ALTER TABLE domains ADD COLUMN external INTEGER NOT NULL DEFAULT 0`) //nolint:errcheck
+
 	log.Printf("Main DB ready: %s", mainDBFile)
 }
 
 func setDomainStatus(domain, status string) {
+	mainDBMu.Lock()
+	defer mainDBMu.Unlock()
+
 	now := time.Now().UTC().Format(time.RFC3339)
 	mainDB.Exec(`UPDATE domains SET status=?, updated_at=? WHERE domain=?`, status, now, domain)
 }
@@ -46,6 +59,8 @@ type DomainRow struct {
 	Interval  int    `json:"interval"`
 	Status    string `json:"status"`
 	Parent    string `json:"parent,omitempty"`
+	Internal  int    `json:"internal"`
+	External  int    `json:"external"`
 	URLCount  int    `json:"url_count"`
 	QueueLen  int    `json:"queue_len"`
 	CreatedAt string `json:"created_at"`
@@ -54,7 +69,7 @@ type DomainRow struct {
 
 func listDomains() ([]DomainRow, error) {
 	rows, err := mainDB.Query(
-		`SELECT id, domain, interval, status, parent, created_at, updated_at
+		`SELECT id, domain, interval, status, parent, internal, external, created_at, updated_at
 		 FROM domains ORDER BY id ASC`)
 	if err != nil {
 		return nil, err
@@ -65,7 +80,7 @@ func listDomains() ([]DomainRow, error) {
 	for rows.Next() {
 		var d DomainRow
 		if err := rows.Scan(&d.ID, &d.Domain, &d.Interval, &d.Status,
-			&d.Parent, &d.CreatedAt, &d.UpdatedAt); err != nil {
+			&d.Parent, &d.Internal, &d.External, &d.CreatedAt, &d.UpdatedAt); err != nil {
 			continue
 		}
 		d.URLCount = mariaCount("url", d.Domain)
@@ -75,15 +90,26 @@ func listDomains() ([]DomainRow, error) {
 	return out, nil
 }
 
-func registerDomain(domain string, interval int, parentDomain string) error {
+func getDomainConfig(domain string) (interval int, internal int, external int, err error) {
+	var iv, internalVal, externalVal int
+	err = mainDB.QueryRow(`SELECT interval, internal, external FROM domains WHERE domain=?`, domain).Scan(&iv, &internalVal, &externalVal)
+	return iv, internalVal, externalVal, err
+}
+
+func registerDomain(domain string, interval int, parentDomain string, internal int, external int) error {
+	mainDBMu.Lock()
+	defer mainDBMu.Unlock()
+
 	now := time.Now().UTC().Format(time.RFC3339)
 	_, err := mainDB.Exec(`
-		INSERT INTO domains (domain, interval, status, parent, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?)
+		INSERT INTO domains (domain, interval, status, parent, internal, external, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(domain) DO UPDATE SET
 			interval=excluded.interval,
+			internal=excluded.internal,
+			external=excluded.external,
 			updated_at=excluded.updated_at`,
-		domain, interval, statusPending, parentDomain, now, now)
+		domain, interval, statusPending, parentDomain, internal, external, now, now)
 	return err
 }
 
@@ -113,6 +139,13 @@ func initSkipDB() {
 		{"facebook.com", "social media tracker"},
 		{"linkedin.com", "social media tracker"},
 		{"googletagmanager.com", "tag manager / analytics"},
+		{"tumblr.com", "blogging platform"},
+		{"twitter.com", "social media platform"},
+		{"instagram.com", "social media platform"},
+		{"youtube.com", "video platform"},
+		{"tiktok.com", "video platform"},
+		{"reddit.com", "social media platform"},
+		{"pinterest.com", "social media platform"},
 	}
 	now := time.Now().UTC().Format(time.RFC3339)
 	for _, e := range defaults {
@@ -125,24 +158,24 @@ func initSkipDB() {
 
 // isDomainSkipped returns true if domain or any parent suffix is in the skip list.
 func isDomainSkipped(domain string) bool {
+	// Normalize domain: remove trailing dots and convert to lowercase
+	domain = strings.ToLower(strings.TrimSuffix(domain, "."))
+
+	// Check exact match first
 	var c int
 	skipDB.QueryRow(`SELECT COUNT(1) FROM skip_domains WHERE domain = ?`, domain).Scan(&c)
 	if c > 0 {
 		return true
 	}
-	rows, err := skipDB.Query(`SELECT domain FROM skip_domains`)
-	if err != nil {
-		return false
+
+	// Check if any skip entry matches as a suffix (subdomain check)
+	// Using SQL LIKE for better performance: '%.tumblr.com' matches any subdomain of tumblr.com
+	skipDB.QueryRow(`SELECT COUNT(1) FROM skip_domains WHERE ? LIKE '%' || domain || '.'`, domain).Scan(&c)
+	if c > 0 {
+		return true
 	}
-	defer rows.Close()
-	for rows.Next() {
-		var entry string
-		if rows.Scan(&entry) != nil {
-			continue
-		}
-		if strings.HasSuffix(domain, "."+entry) {
-			return true
-		}
-	}
-	return false
+
+	// Also check if domain itself ends with any skip entry (for cases like 'sub.tumblr.com')
+	skipDB.QueryRow(`SELECT COUNT(1) FROM skip_domains WHERE ? LIKE '%.' || domain`, domain).Scan(&c)
+	return c > 0
 }

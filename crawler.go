@@ -9,6 +9,7 @@ import (
 	"math/rand"
 	"net/http"
 	"net/url"
+	"os"
 	"regexp"
 	"strings"
 	"time"
@@ -53,7 +54,7 @@ func recordExtLink(srcDomain, extDomain string, parentInterval int) {
 	if !insertExtLink(srcDomain, extDomain) {
 		return // already recorded
 	}
-	if err := registerDomain(extDomain, parentInterval, srcDomain); err != nil {
+	if err := registerDomain(extDomain, parentInterval, srcDomain, 0, 1); err != nil {
 		log.Printf("registerDomain %s (from %s): %v", extDomain, srcDomain, err)
 		return
 	}
@@ -166,6 +167,12 @@ func interruptibleSleep(ctx context.Context, domain string, br *Broker, d time.D
 }
 
 // ─────────────────────────────────────────────────────────────────
+//  Constants
+// ─────────────────────────────────────────────────────────────────
+
+const userAgent = "SiliconPinSpider/1.0 (+https://siliconpin.com/bot-siliconpin_spider)"
+
+// ─────────────────────────────────────────────────────────────────
 //  robots.txt
 // ─────────────────────────────────────────────────────────────────
 
@@ -177,7 +184,12 @@ type robotsRules struct {
 func fetchRobots(domain string) *robotsRules {
 	rules := &robotsRules{}
 	client := &http.Client{Timeout: 15 * time.Second}
-	resp, err := client.Get("https://" + domain + "/robots.txt")
+	req, err := http.NewRequest("GET", "https://"+domain+"/robots.txt", nil)
+	if err != nil {
+		return rules
+	}
+	req.Header.Set("User-Agent", userAgent)
+	resp, err := client.Do(req)
 	if err != nil || resp.StatusCode != 200 {
 		return rules
 	}
@@ -282,6 +294,15 @@ func crawlDomain(ctx context.Context, domain string, intervalSec int) {
 	}()
 
 	log.Printf("[%s] crawler started (interval %ds)", domain, intervalSec)
+
+	// Get domain configuration
+	_, internal, external, err := getDomainConfig(domain)
+	if err != nil {
+		log.Printf("[%s] failed to get domain config: %v", domain, err)
+		setDomainStatus(domain, statusDone)
+		return
+	}
+
 	br := getBroker(domain)
 	ensurePauseChannels(domain)
 
@@ -307,6 +328,16 @@ func crawlDomain(ctx context.Context, domain string, intervalSec int) {
 		mainDB.Exec(`UPDATE domains SET interval=?, updated_at=? WHERE domain=?`,
 			intervalSec, now, domain)
 	}
+
+	// Apply MIN_DELAY override if set
+	if minDelay := os.Getenv("MIN_DELAY"); minDelay != "" {
+		var minDelayInt int
+		if _, err := fmt.Sscanf(minDelay, "%d", &minDelayInt); err == nil && minDelayInt > intervalSec {
+			intervalSec = minDelayInt
+			log.Printf("[%s] MIN_DELAY override applied: %d seconds", domain, intervalSec)
+		}
+	}
+
 	emit(br, "robots", map[string]interface{}{
 		"disallowed":      robots.disallowed,
 		"robots_delay":    robots.crawlDelay,
@@ -382,7 +413,15 @@ func crawlDomain(ctx context.Context, domain string, intervalSec int) {
 		}
 
 		emit(br, "fetching", map[string]string{"url": target})
-		resp, err := httpClient.Get(target)
+		req, err := http.NewRequest("GET", target, nil)
+		if err != nil {
+			emit(br, "error", map[string]string{"url": target, "msg": err.Error()})
+			log.Printf("[%s] fetch error %s: %v", domain, target, err)
+			enqueueURL(domain, target) // retry next run
+			continue
+		}
+		req.Header.Set("User-Agent", userAgent)
+		resp, err := httpClient.Do(req)
 		if err != nil {
 			emit(br, "error", map[string]string{"url": target, "msg": err.Error()})
 			log.Printf("[%s] fetch error %s: %v", domain, target, err)
@@ -413,12 +452,16 @@ func crawlDomain(ctx context.Context, domain string, intervalSec int) {
 			links := extractLinks(parsed, bodyStr)
 
 			newCount := 0
-			for _, link := range links.sameHost {
-				if !isURLKnown(domain, link) {
-					enqueueURL(domain, link)
-					newCount++
+			// Process internal links if enabled
+			if internal > 0 {
+				for _, link := range links.sameHost {
+					if !isURLKnown(domain, link) {
+						enqueueURL(domain, link)
+						newCount++
+					}
 				}
 			}
+
 			emit(br, "links_found", map[string]interface{}{
 				"url":       target,
 				"found":     len(links.sameHost),
@@ -427,8 +470,11 @@ func crawlDomain(ctx context.Context, domain string, intervalSec int) {
 				"external":  len(links.external),
 			})
 
-			for _, extDomain := range links.external {
-				recordExtLink(domain, extDomain, intervalSec)
+			// Process external links if enabled
+			if external > 0 {
+				for _, extDomain := range links.external {
+					recordExtLink(domain, extDomain, intervalSec)
+				}
 			}
 		}
 	}

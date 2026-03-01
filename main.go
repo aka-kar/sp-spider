@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"log"
-	"math/rand"
 	"net/http"
 	"os"
 	"os/signal"
@@ -18,7 +17,6 @@ func init() {
 }
 
 func main() {
-	rand.Seed(time.Now().UnixNano()) //nolint:staticcheck
 
 	loadEnv(".env")
 
@@ -76,12 +74,12 @@ func main() {
 	}()
 
 	// Resume domains from previous run
-	rows, err := mainDB.Query(`SELECT domain, interval, status FROM domains`)
+	rows, err := mainDB.Query(`SELECT domain, interval, status, internal, external FROM domains`)
 	if err == nil {
 		for rows.Next() {
 			var d, status string
-			var iv int
-			if rows.Scan(&d, &iv, &status) != nil {
+			var iv, internal, external int
+			if rows.Scan(&d, &iv, &status, &internal, &external) != nil {
 				continue
 			}
 			if status == statusDone {
@@ -89,8 +87,7 @@ func main() {
 			}
 			if status == statusPaused {
 				ensurePauseChannels(d)
-				pauseCrawler(d)
-				tryStartCrawler(d, iv)
+				// Don't start paused crawlers - they should remain paused until manually resumed
 			} else {
 				setDomainStatus(d, statusPending)
 				tryStartCrawler(d, iv)
