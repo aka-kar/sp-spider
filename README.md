@@ -101,12 +101,10 @@ curl -X POST http://localhost:8080/api/add_domain \
   "message":  "domain added, crawler started",
   "domain":   "siliconpin.com",
   "interval": 20,
-  "db_file":  "siliconpin.com.sqlite",
   "sse":      "/api/sse/siliconpin.com"
 }
 ```
 
-Creates **`siliconpin.com.sqlite`** with table:
 
 ```
 urls(id, url UNIQUE, created_at, updated_at)
