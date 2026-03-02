@@ -36,6 +36,9 @@ WORKDIR /app
 # Copy binary from builder
 COPY --from=builder /app/sp-spider .
 
+# Copy static files
+COPY --from=builder /app/static ./static
+
 # Create data directory for persistence
 RUN mkdir -p /app/data
 
