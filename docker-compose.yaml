@@ -1,0 +1,15 @@
+services:
+  sp-spider:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: sp-spider
+    ports:
+      - "8080:8080"
+    volumes:
+      # Mount current directory as /app/data for persistent storage
+      - ./:/app/data
+      # Mount .env file to container root
+      - ./.env:/.env
+    working_dir: /app
+    restart: unless-stopped
