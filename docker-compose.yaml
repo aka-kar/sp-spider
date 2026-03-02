@@ -11,5 +11,15 @@ services:
       - ./:/app/data
       # Mount .env file to container root
       - ./.env:/.env
+    environment:
+      # Environment variables from .env.sample
+      - MARIA_DB_HOST=l2
+      - MARIA_DB_PORT=3306
+      - MARIA_DB_USER=sp
+      - MARIA_DB_PASS=0000
+      - MARIA_DB_DATABASE=sp_spider
+      - MARIA_DB_TABLE=sp_spider
+      - MARIA_DB_TABLE_DOMAINS=sp_domains
+      - MAX_CRAWLERS=20
     working_dir: /app
     restart: unless-stopped
